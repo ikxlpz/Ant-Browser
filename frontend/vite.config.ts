@@ -27,6 +27,7 @@ function resolveDevPort() {
 
 const devPort = resolveDevPort()
 const disableHmr = resolveBoolean(process.env.FRONTEND_DISABLE_HMR, false)
+const cleanDist = resolveBoolean(process.env.FRONTEND_CLEAN_DIST, false)
 
 export default defineConfig({
   plugins: [react()],
@@ -45,7 +46,7 @@ export default defineConfig({
   build: {
     outDir: 'dist',
     assetsDir: 'assets',
-    emptyOutDir: true,
+    emptyOutDir: cleanDist,
     rollupOptions: {
       output: {
         manualChunks: {

@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 )
 
@@ -42,14 +43,19 @@ func EnsureDefaultBookmarks(userDataDir string, bookmarks []config.BrowserBookma
 		root = newEmptyBookmarkRoot(now)
 	}
 
-	// 取出 bookmark_bar children，收集已有 URL 集合
-	barChildren, existingURLs := extractBarChildren(root)
+	// 取出 bookmark_bar children，按整个书签树收集已有 URL 集合
+	barChildren := extractBarChildren(root)
+	existingURLs := collectRootURLs(root)
 
 	// 计算当前最大 id，用于分配新 id
 	maxID := findMaxID(root)
 
 	// 把不存在的默认书签追加进去
+	added := false
 	for _, b := range bookmarks {
+		if b.Name == "" || b.URL == "" {
+			continue
+		}
 		if existingURLs[b.URL] {
 			continue
 		}
@@ -64,6 +70,12 @@ func EnsureDefaultBookmarks(userDataDir string, bookmarks []config.BrowserBookma
 			"type":           "url",
 			"url":            b.URL,
 		})
+		existingURLs[b.URL] = true
+		added = true
+	}
+
+	if !added {
+		return nil
 	}
 
 	// 写回
@@ -79,6 +91,86 @@ func EnsureDefaultBookmarks(userDataDir string, bookmarks []config.BrowserBookma
 		return fmt.Errorf("序列化书签失败: %w", err)
 	}
 	return os.WriteFile(bookmarksPath, out, 0644)
+}
+
+// ReplaceBookmarkURL 将已有书签中的 oldURL 更新为 newURL，用于修复运行时动态书签地址。
+func ReplaceBookmarkURL(userDataDir string, oldURL string, newURL string) (bool, error) {
+	oldURL = strings.TrimSpace(oldURL)
+	newURL = strings.TrimSpace(newURL)
+	if oldURL == "" || newURL == "" || strings.EqualFold(oldURL, newURL) {
+		return false, nil
+	}
+	return replaceBookmarkURL(userDataDir, newURL, func(node map[string]interface{}) bool {
+		urlValue, _ := node["url"].(string)
+		return strings.EqualFold(strings.TrimSpace(urlValue), oldURL)
+	})
+}
+
+func replaceBookmarkURL(userDataDir string, newURL string, match func(map[string]interface{}) bool) (bool, error) {
+	bookmarksPath := filepath.Join(userDataDir, "Default", "Bookmarks")
+	data, err := os.ReadFile(bookmarksPath)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return false, nil
+		}
+		return false, err
+	}
+	var root map[string]interface{}
+	if err := json.Unmarshal(data, &root); err != nil {
+		return false, fmt.Errorf("解析书签失败: %w", err)
+	}
+	roots, ok := root["roots"].(map[string]interface{})
+	if !ok {
+		return false, nil
+	}
+	changed := false
+	for _, item := range roots {
+		folder, ok := item.(map[string]interface{})
+		if !ok {
+			continue
+		}
+		if children, ok := folder["children"].([]interface{}); ok {
+			if replaceBookmarkURLInNodes(children, newURL, match) {
+				folder["date_modified"] = toChromiumTime(time.Now())
+				changed = true
+			}
+		}
+	}
+	if !changed {
+		return false, nil
+	}
+	out, err := json.MarshalIndent(root, "", "   ")
+	if err != nil {
+		return false, fmt.Errorf("序列化书签失败: %w", err)
+	}
+	return true, os.WriteFile(bookmarksPath, out, 0644)
+}
+
+func replaceBookmarkURLInNodes(nodes []interface{}, newURL string, match func(map[string]interface{}) bool) bool {
+	changed := false
+	for _, item := range nodes {
+		node, ok := item.(map[string]interface{})
+		if !ok {
+			continue
+		}
+		if node["type"] == "url" {
+			if match(node) {
+				node["url"] = newURL
+				node["guid"] = bookmarkGUID(newURL)
+				changed = true
+			}
+			continue
+		}
+		if node["type"] == "folder" {
+			if children, ok := node["children"].([]interface{}); ok {
+				if replaceBookmarkURLInNodes(children, newURL, match) {
+					node["date_modified"] = toChromiumTime(time.Now())
+					changed = true
+				}
+			}
+		}
+	}
+	return changed
 }
 
 // newEmptyBookmarkRoot 构建一个空的书签根结构
@@ -121,9 +213,8 @@ func newEmptyBookmarkRoot(now string) map[string]interface{} {
 	}
 }
 
-// extractBarChildren 从根结构中提取书签栏 children 和已有 URL 集合
-func extractBarChildren(root map[string]interface{}) ([]interface{}, map[string]bool) {
-	existing := map[string]bool{}
+// extractBarChildren 从根结构中提取书签栏 children
+func extractBarChildren(root map[string]interface{}) []interface{} {
 	var children []interface{}
 
 	roots, ok := root["roots"].(map[string]interface{})
@@ -135,7 +226,7 @@ func extractBarChildren(root map[string]interface{}) ([]interface{}, map[string]
 				"name":     "书签栏",
 			},
 		}
-		return children, existing
+		return children
 	}
 
 	bar, ok := roots["bookmark_bar"].(map[string]interface{})
@@ -146,14 +237,31 @@ func extractBarChildren(root map[string]interface{}) ([]interface{}, map[string]
 			"name":     "书签栏",
 		}
 		root["roots"] = roots
-		return children, existing
+		return children
 	}
 
 	if c, ok := bar["children"].([]interface{}); ok {
 		children = c
-		collectURLs(c, existing)
 	}
-	return children, existing
+	return children
+}
+
+func collectRootURLs(root map[string]interface{}) map[string]bool {
+	existing := map[string]bool{}
+	roots, ok := root["roots"].(map[string]interface{})
+	if !ok {
+		return existing
+	}
+	for _, item := range roots {
+		folder, ok := item.(map[string]interface{})
+		if !ok {
+			continue
+		}
+		if children, ok := folder["children"].([]interface{}); ok {
+			collectURLs(children, existing)
+		}
+	}
+	return existing
 }
 
 // collectURLs 递归收集所有书签 URL

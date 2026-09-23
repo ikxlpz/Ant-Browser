@@ -164,11 +164,11 @@ func userStateRootForOS(goos, fallback string) string {
 		if base := strings.TrimSpace(os.Getenv("XDG_DATA_HOME")); base != "" {
 			return filepath.Join(base, appStateDirName)
 		}
-		if home, err := os.UserHomeDir(); err == nil && strings.TrimSpace(home) != "" {
+		if home := configuredHomeDir(); home != "" {
 			return filepath.Join(home, ".local", "share", appStateDirName)
 		}
 	case "darwin":
-		if home, err := os.UserHomeDir(); err == nil && strings.TrimSpace(home) != "" {
+		if home := configuredHomeDir(); home != "" {
 			return filepath.Join(home, "Library", "Application Support", appStateDirName)
 		}
 	}
@@ -176,6 +176,16 @@ func userStateRootForOS(goos, fallback string) string {
 		return filepath.Join(tmp, appStateDirName)
 	}
 	return fallback
+}
+
+func configuredHomeDir() string {
+	if home := strings.TrimSpace(os.Getenv("HOME")); home != "" {
+		return home
+	}
+	if home, err := os.UserHomeDir(); err == nil {
+		return strings.TrimSpace(home)
+	}
+	return ""
 }
 
 func isMacAppBundleRoot(dir string) bool {

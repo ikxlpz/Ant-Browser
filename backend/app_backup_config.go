@@ -1,0 +1,453 @@
+package backend
+
+import (
+	"ant-chrome/backend/internal/config"
+	"database/sql"
+	"fmt"
+	"path/filepath"
+	"strings"
+)
+
+func (a *App) backupResolveDBPath(cfg *config.Config) string {
+	if cfg == nil {
+		return a.resolveAppPath("data/app.db")
+	}
+	path := strings.TrimSpace(cfg.Database.SQLite.Path)
+	if path == "" {
+		path = "data/app.db"
+	}
+	return a.resolveAppPath(path)
+}
+
+func (a *App) backupResolveUserDataRoot(cfg *config.Config) string {
+	if cfg == nil {
+		return a.resolveAppPath("data")
+	}
+	root := strings.TrimSpace(cfg.Browser.UserDataRoot)
+	if root == "" {
+		root = "data"
+	}
+	return a.resolveAppPath(root)
+}
+
+func (a *App) backupApplyIncomingConfig(incoming *config.Config) error {
+	if incoming == nil {
+		return nil
+	}
+	current := a.config
+	if current == nil {
+		current = config.DefaultConfig()
+	}
+	incoming = a.backupNormalizeImportedConfigPaths(incoming, current)
+
+	target := backupMergeConfig(current, incoming)
+	target.Database = current.Database
+	target.Backup = current.Backup
+
+	if err := target.Save(a.resolveAppPath("config.yaml")); err != nil {
+		return fmt.Errorf("保存导入配置失败: %w", err)
+	}
+	a.config = target
+	a.applyRuntimeConfig(target.Runtime)
+	return nil
+}
+
+func (a *App) backupNormalizeImportedConfigPaths(incoming, current *config.Config) *config.Config {
+	if incoming == nil {
+		return nil
+	}
+	normalized := *incoming
+	normalized.Browser = incoming.Browser
+	normalized.Browser.Cores = append([]config.BrowserCore(nil), incoming.Browser.Cores...)
+	normalized.Browser.Profiles = append([]config.BrowserProfileConfig(nil), incoming.Browser.Profiles...)
+
+	currentUserDataRoot := "data"
+	if current != nil && strings.TrimSpace(current.Browser.UserDataRoot) != "" {
+		currentUserDataRoot = strings.TrimSpace(current.Browser.UserDataRoot)
+	}
+	normalized.Browser.UserDataRoot = a.backupNormalizeImportedRootPath(
+		normalized.Browser.UserDataRoot,
+		currentUserDataRoot,
+	)
+
+	currentCores := make(map[string]string)
+	if current != nil {
+		for _, core := range current.Browser.Cores {
+			if id := strings.TrimSpace(core.CoreId); id != "" && strings.TrimSpace(core.CorePath) != "" {
+				currentCores[id] = strings.TrimSpace(core.CorePath)
+			}
+		}
+	}
+	normalized.Browser.CoreRoot = a.backupNormalizeImportedRootPath(normalized.Browser.CoreRoot, "chrome")
+	coreRoot := strings.TrimSpace(normalized.Browser.CoreRoot)
+	if coreRoot == "" {
+		coreRoot = "chrome"
+	}
+	for i := range normalized.Browser.Cores {
+		core := &normalized.Browser.Cores[i]
+		corePath := strings.TrimSpace(core.CorePath)
+		if corePath == "" {
+			continue
+		}
+		fallback := currentCores[strings.TrimSpace(core.CoreId)]
+		if fallback == "" {
+			coreID := strings.TrimSpace(core.CoreId)
+			if coreID == "" {
+				coreID = fmt.Sprintf("core-%02d", i+1)
+			}
+			fallback = filepath.Join(coreRoot, "external", coreID)
+		}
+		core.CorePath = a.backupNormalizeImportedRuntimePath(corePath, fallback)
+	}
+	currentProfiles := make(map[string]string)
+	if current != nil {
+		for _, profile := range current.Browser.Profiles {
+			if id := strings.TrimSpace(profile.ProfileId); id != "" && strings.TrimSpace(profile.UserDataDir) != "" {
+				currentProfiles[id] = strings.TrimSpace(profile.UserDataDir)
+			}
+		}
+	}
+	for i := range normalized.Browser.Profiles {
+		profile := &normalized.Browser.Profiles[i]
+		profilePath := strings.TrimSpace(profile.UserDataDir)
+		if profilePath == "" {
+			continue
+		}
+		fallback := currentProfiles[strings.TrimSpace(profile.ProfileId)]
+		if fallback == "" {
+			base := filepath.Base(filepath.Clean(filepath.FromSlash(strings.ReplaceAll(profilePath, "\\", "/"))))
+			if base == "." || base == ".." || base == string(filepath.Separator) || base == "" {
+				base = strings.TrimSpace(profile.ProfileId)
+			}
+			if base == "" {
+				base = fmt.Sprintf("profile-%02d", i+1)
+			}
+			fallback = base
+		}
+		profile.UserDataDir = a.backupNormalizeImportedProfilePath(profilePath, normalized.Browser.UserDataRoot, fallback)
+	}
+
+	if current != nil {
+		normalized.Browser.ChromeBinaryPath = a.backupNormalizePortablePath(normalized.Browser.ChromeBinaryPath, current.Browser.ChromeBinaryPath)
+		normalized.Browser.ClashBinaryPath = a.backupNormalizePortablePath(normalized.Browser.ClashBinaryPath, current.Browser.ClashBinaryPath)
+		normalized.Browser.XrayBinaryPath = a.backupNormalizePortablePath(normalized.Browser.XrayBinaryPath, current.Browser.XrayBinaryPath)
+		normalized.Browser.SingBoxBinaryPath = a.backupNormalizePortablePath(normalized.Browser.SingBoxBinaryPath, current.Browser.SingBoxBinaryPath)
+		normalized.Logging.FilePath = a.backupNormalizePortablePath(normalized.Logging.FilePath, current.Logging.FilePath)
+		normalized.Automation.ArtifactsDir = a.backupNormalizePortablePath(normalized.Automation.ArtifactsDir, current.Automation.ArtifactsDir)
+	} else {
+		normalized.Browser.ChromeBinaryPath = a.backupNormalizePortablePath(normalized.Browser.ChromeBinaryPath, "")
+		normalized.Browser.ClashBinaryPath = a.backupNormalizePortablePath(normalized.Browser.ClashBinaryPath, "")
+		normalized.Browser.XrayBinaryPath = a.backupNormalizePortablePath(normalized.Browser.XrayBinaryPath, "")
+		normalized.Browser.SingBoxBinaryPath = a.backupNormalizePortablePath(normalized.Browser.SingBoxBinaryPath, "")
+		normalized.Logging.FilePath = a.backupNormalizePortablePath(normalized.Logging.FilePath, "data/logs/app.log")
+		normalized.Automation.ArtifactsDir = a.backupNormalizePortablePath(normalized.Automation.ArtifactsDir, "data/automation/artifacts")
+	}
+	return &normalized
+}
+
+func (a *App) backupNormalizeImportedRootPath(value, fallback string) string {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return value
+	}
+	if filepath.IsAbs(value) {
+		return a.backupNormalizePortablePath(value, fallback)
+	}
+
+	clean := filepath.Clean(filepath.FromSlash(strings.ReplaceAll(value, "\\", "/")))
+	if clean == "." || !a.backupPathWithinRuntimeRoots(a.resolveAppPath(clean)) {
+		return strings.TrimSpace(fallback)
+	}
+	return filepath.ToSlash(clean)
+}
+
+func (a *App) backupNormalizeImportedRuntimePath(value, fallback string) string {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return value
+	}
+	if filepath.IsAbs(value) {
+		return a.backupNormalizePortablePath(value, fallback)
+	}
+
+	clean := filepath.Clean(filepath.FromSlash(strings.ReplaceAll(value, "\\", "/")))
+	if clean == "." || !a.backupPathWithinRuntimeRoots(a.resolveAppPath(clean)) {
+		return strings.TrimSpace(fallback)
+	}
+	return filepath.ToSlash(clean)
+}
+
+func (a *App) backupNormalizePortablePath(value, fallback string) string {
+	value = strings.TrimSpace(value)
+	if value == "" || !filepath.IsAbs(value) {
+		return value
+	}
+	if rel, ok := a.backupRelativeRuntimePath(value); ok {
+		return rel
+	}
+	return strings.TrimSpace(fallback)
+}
+
+func (a *App) backupPathWithinRuntimeRoots(path string) bool {
+	for _, root := range backupUniqueNonEmpty([]string{a.appStateRootAbs(), a.appRootAbs()}) {
+		if backupPathWithin(path, root) {
+			return true
+		}
+	}
+	return false
+}
+
+func (a *App) backupRelativeRuntimePath(path string) (string, bool) {
+	for _, root := range backupUniqueNonEmpty([]string{a.appStateRootAbs(), a.appRootAbs()}) {
+		rel, err := filepath.Rel(filepath.Clean(root), filepath.Clean(path))
+		if err != nil || rel == "." || rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
+			continue
+		}
+		return filepath.ToSlash(rel), true
+	}
+	return "", false
+}
+
+func (a *App) backupNormalizeImportedProfilePath(value, userDataRoot, fallback string) string {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return value
+	}
+	value = filepath.Clean(filepath.FromSlash(strings.ReplaceAll(value, "\\", "/")))
+	if !filepath.IsAbs(value) && (value == ".." || strings.HasPrefix(value, ".."+string(filepath.Separator))) {
+		return strings.TrimSpace(fallback)
+	}
+
+	root := strings.TrimSpace(userDataRoot)
+	if root == "" {
+		root = "data"
+	}
+	rootAbs := a.resolveAppPath(root)
+	if !filepath.IsAbs(value) && !filepath.IsAbs(root) {
+		if rel, err := filepath.Rel(filepath.Clean(filepath.FromSlash(root)), value); err == nil && rel != "." && rel != ".." && !strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
+			return filepath.ToSlash(rel)
+		}
+		return filepath.ToSlash(value)
+	}
+	if !filepath.IsAbs(value) {
+		return filepath.ToSlash(value)
+	}
+	if rel, err := filepath.Rel(filepath.Clean(rootAbs), filepath.Clean(value)); err == nil && rel != "." && rel != ".." && !strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
+		return filepath.ToSlash(rel)
+	}
+	return strings.TrimSpace(fallback)
+}
+
+func backupMergeConfig(current, incoming *config.Config) *config.Config {
+	if current == nil {
+		cp := *incoming
+		return &cp
+	}
+	if incoming == nil {
+		cp := *current
+		return &cp
+	}
+	merged := *current
+	if strings.TrimSpace(merged.App.Name) == "" {
+		merged.App.Name = incoming.App.Name
+	}
+	merged.Browser.DefaultBookmarks = backupMergeBookmarks(merged.Browser.DefaultBookmarks, incoming.Browser.DefaultBookmarks)
+	merged.Browser.Cores = backupMergeCores(merged.Browser.Cores, incoming.Browser.Cores)
+	merged.Browser.Proxies = backupMergeProxies(merged.Browser.Proxies, incoming.Browser.Proxies)
+	merged.Browser.Profiles = backupMergeProfiles(merged.Browser.Profiles, incoming.Browser.Profiles)
+	return &merged
+}
+
+func backupUnionStrings(a, b []string) []string {
+	seen := map[string]struct{}{}
+	out := make([]string, 0, len(a)+len(b))
+	for _, item := range append(append([]string{}, a...), b...) {
+		item = strings.TrimSpace(item)
+		if item == "" {
+			continue
+		}
+		key := strings.ToLower(item)
+		if _, ok := seen[key]; ok {
+			continue
+		}
+		seen[key] = struct{}{}
+		out = append(out, item)
+	}
+	return out
+}
+
+func backupMergeBookmarks(a, b []config.BrowserBookmark) []config.BrowserBookmark {
+	seen := map[string]struct{}{}
+	out := make([]config.BrowserBookmark, 0, len(a)+len(b))
+	appendOne := func(item config.BrowserBookmark) {
+		urlKey := strings.ToLower(strings.TrimSpace(item.URL))
+		if urlKey == "" {
+			return
+		}
+		if _, ok := seen[urlKey]; ok {
+			return
+		}
+		seen[urlKey] = struct{}{}
+		out = append(out, item)
+	}
+	for _, item := range a {
+		appendOne(item)
+	}
+	for _, item := range b {
+		appendOne(item)
+	}
+	return out
+}
+
+func backupMergeCores(a, b []config.BrowserCore) []config.BrowserCore {
+	seenID := map[string]struct{}{}
+	seenPath := map[string]struct{}{}
+	out := make([]config.BrowserCore, 0, len(a)+len(b))
+	appendOne := func(item config.BrowserCore) {
+		idKey := strings.ToLower(strings.TrimSpace(item.CoreId))
+		pathKey := strings.ToLower(strings.TrimSpace(item.CorePath))
+		if idKey == "" && pathKey == "" {
+			return
+		}
+		if idKey != "" {
+			if _, ok := seenID[idKey]; ok {
+				return
+			}
+		}
+		if pathKey != "" {
+			if _, ok := seenPath[pathKey]; ok {
+				return
+			}
+		}
+		if idKey != "" {
+			seenID[idKey] = struct{}{}
+		}
+		if pathKey != "" {
+			seenPath[pathKey] = struct{}{}
+		}
+		out = append(out, item)
+	}
+	for _, item := range a {
+		appendOne(item)
+	}
+	for _, item := range b {
+		appendOne(item)
+	}
+	return out
+}
+
+func backupMergeProxies(a, b []config.BrowserProxy) []config.BrowserProxy {
+	seenID := map[string]struct{}{}
+	seenCfg := map[string]struct{}{}
+	out := make([]config.BrowserProxy, 0, len(a)+len(b))
+	appendOne := func(item config.BrowserProxy) {
+		idKey := strings.ToLower(strings.TrimSpace(item.ProxyId))
+		cfgKey := strings.ToLower(strings.TrimSpace(item.ProxyConfig))
+		if idKey == "" && cfgKey == "" {
+			return
+		}
+		if idKey != "" {
+			if _, ok := seenID[idKey]; ok {
+				return
+			}
+		}
+		if cfgKey != "" {
+			if _, ok := seenCfg[cfgKey]; ok {
+				return
+			}
+		}
+		if idKey != "" {
+			seenID[idKey] = struct{}{}
+		}
+		if cfgKey != "" {
+			seenCfg[cfgKey] = struct{}{}
+		}
+		out = append(out, item)
+	}
+	for _, item := range a {
+		appendOne(item)
+	}
+	for _, item := range b {
+		appendOne(item)
+	}
+	return out
+}
+
+func backupMergeProfiles(a, b []config.BrowserProfileConfig) []config.BrowserProfileConfig {
+	seenID := map[string]struct{}{}
+	seenDir := map[string]struct{}{}
+	out := make([]config.BrowserProfileConfig, 0, len(a)+len(b))
+	appendOne := func(item config.BrowserProfileConfig) {
+		idKey := strings.ToLower(strings.TrimSpace(item.ProfileId))
+		dirKey := strings.ToLower(strings.TrimSpace(item.UserDataDir))
+		if idKey == "" && dirKey == "" {
+			return
+		}
+		if idKey != "" {
+			if _, ok := seenID[idKey]; ok {
+				return
+			}
+		}
+		if dirKey != "" {
+			if _, ok := seenDir[dirKey]; ok {
+				return
+			}
+		}
+		if idKey != "" {
+			seenID[idKey] = struct{}{}
+		}
+		if dirKey != "" {
+			seenDir[dirKey] = struct{}{}
+		}
+		out = append(out, item)
+	}
+	for _, item := range a {
+		appendOne(item)
+	}
+	for _, item := range b {
+		appendOne(item)
+	}
+	return out
+}
+
+func backupSrcTableExists(tx *sql.Tx, table string) (bool, error) {
+	var cnt int
+	err := tx.QueryRow(`SELECT COUNT(1) FROM src.sqlite_master WHERE type='table' AND name=?`, table).Scan(&cnt)
+	if err != nil {
+		return false, err
+	}
+	return cnt > 0, nil
+}
+
+func backupSrcColumnExists(tx *sql.Tx, table string, column string) (bool, error) {
+	rows, err := tx.Query("PRAGMA src.table_info(" + table + ")")
+	if err != nil {
+		return false, err
+	}
+	defer rows.Close()
+
+	for rows.Next() {
+		var cid int
+		var name string
+		var columnType string
+		var notNull int
+		var defaultValue any
+		var pk int
+		if err := rows.Scan(&cid, &name, &columnType, &notNull, &defaultValue, &pk); err != nil {
+			return false, err
+		}
+		if strings.EqualFold(name, column) {
+			return true, nil
+		}
+	}
+	return false, rows.Err()
+}
+
+func backupCountRows(tx *sql.Tx, tableName string) (int, error) {
+	var cnt int
+	row := tx.QueryRow("SELECT COUNT(1) FROM " + tableName)
+	if err := row.Scan(&cnt); err != nil {
+		return 0, err
+	}
+	return cnt, nil
+}

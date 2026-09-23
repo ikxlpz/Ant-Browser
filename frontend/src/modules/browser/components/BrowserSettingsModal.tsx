@@ -1,6 +1,6 @@
-import { useState } from 'react'
+﻿import { useState } from 'react'
 import { CheckCircle, Edit2, Plus, Star, Trash2, XCircle } from 'lucide-react'
-import { Button, Card, FormItem, Input, Modal, Table, Textarea, toast } from '../../../shared/components'
+import { Button, Card, FormItem, Input, Modal, Switch, Table, Textarea, toast } from '../../../shared/components'
 import type { TableColumn } from '../../../shared/components/Table'
 import type { BrowserCore, BrowserCoreInput, BrowserSettings } from '../types'
 import {
@@ -23,6 +23,7 @@ export function BrowserSettingsModal({ open, onClose, settings: initSettings, co
   const [settings, setSettings] = useState<BrowserSettings>(initSettings)
   const [fingerprintText, setFingerprintText] = useState((initSettings.defaultFingerprintArgs || []).join('\n'))
   const [launchText, setLaunchText] = useState((initSettings.defaultLaunchArgs || []).join('\n'))
+  const [startUrlsText, setStartUrlsText] = useState((initSettings.defaultStartUrls || []).join('\n'))
   const [saving, setSaving] = useState(false)
 
   // 内核编辑弹窗
@@ -38,6 +39,7 @@ export function BrowserSettingsModal({ open, onClose, settings: initSettings, co
         ...settings,
         defaultFingerprintArgs: fingerprintText.split('\n').map(s => s.trim()).filter(Boolean),
         defaultLaunchArgs: launchText.split('\n').map(s => s.trim()).filter(Boolean),
+        defaultStartUrls: startUrlsText.split('\n').map(s => s.trim()).filter(Boolean),
       })
       toast.success('配置已保存')
       onClose()
@@ -112,7 +114,7 @@ export function BrowserSettingsModal({ open, onClose, settings: initSettings, co
     <>
       <Modal open={open} onClose={onClose} title="基础配置" width="700px"
         footer={<><Button variant="secondary" onClick={onClose}>取消</Button><Button onClick={handleSave} loading={saving}>保存</Button></>}>
-        <div className="space-y-6">
+        <div className="space-y-4">
           <div>
             <div className="flex items-center justify-between mb-2">
               <span className="text-sm font-medium text-[var(--color-text-primary)]">内核管理</span>
@@ -123,14 +125,28 @@ export function BrowserSettingsModal({ open, onClose, settings: initSettings, co
           <FormItem label="用户数据根目录">
             <Input value={settings.userDataRoot} onChange={e => setSettings(p => ({ ...p, userDataRoot: e.target.value }))} placeholder="data" />
           </FormItem>
-          <FormItem label="默认指纹参数（每行一个）">
+          <FormItem label="默认指纹参数" hint="每行一个参数">
             <Textarea value={fingerprintText} onChange={e => setFingerprintText(e.target.value)} rows={3} placeholder="--fingerprint-brand=Chrome" />
           </FormItem>
-          <FormItem label="默认启动参数（每行一个）">
+          <FormItem label="默认启动参数" hint="每行一个参数">
             <Textarea value={launchText} onChange={e => setLaunchText(e.target.value)} rows={3} placeholder="--disable-sync" />
           </FormItem>
-          <FormItem label="默认代理">
-            <Input value={settings.defaultProxy} onChange={e => setSettings(p => ({ ...p, defaultProxy: e.target.value }))} placeholder="http://127.0.0.1:7890" />
+          <FormItem label="默认启动页面" hint="每行一个 URL，留空则启动时不自动打开页面">
+            <Textarea value={startUrlsText} onChange={e => setStartUrlsText(e.target.value)} rows={4} placeholder="启动 URL" />
+          </FormItem>
+          <FormItem label="轻启动模式" hint="先起空白页，实例就绪后再打开默认页面">
+            <div className="flex items-center justify-between rounded-lg border border-[var(--color-border-default)] px-3 py-2">
+              <span className="text-sm text-[var(--color-text-primary)]">延后打开启动页</span>
+              <Switch checked={settings.lightStartEnabled} onChange={checked => setSettings(prev => ({ ...prev, lightStartEnabled: checked }))} />
+            </div>
+          </FormItem>
+          <FormItem label="默认恢复历史标签" hint="实例选择跟随内核时使用；不影响启动页和启动书签。实例未覆盖时，下次启动恢复之前的标签页和窗口。">
+            <div className="flex items-center justify-between rounded-lg border border-[var(--color-border-default)] px-3 py-2">
+              <div>
+                <p className="text-sm text-[var(--color-text-primary)]">内核默认</p>
+              </div>
+              <Switch checked={settings.restoreLastSession} onChange={checked => setSettings(prev => ({ ...prev, restoreLastSession: checked }))} />
+            </div>
           </FormItem>
         </div>
       </Modal>

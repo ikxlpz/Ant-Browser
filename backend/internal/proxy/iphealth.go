@@ -5,13 +5,14 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"strings"
 	"time"
 
 	"ant-chrome/backend/internal/config"
 )
 
-const defaultIPPureInfoURL = "https://my.ippure.com/v1/info"
+const DefaultIPHealthURL = "https://my.ippure.com/v1/info"
 
 // ipQueryEndpoint 备用 IP 查询接口
 type ipQueryEndpoint struct {
@@ -93,81 +94,150 @@ var fallbackEndpoints = []ipQueryEndpoint{
 	},
 }
 
-// FetchIPPureInfo 通过指定代理链路查询出口 IP 健康信息。
-// 优先使用 IPPure 接口，若被 Cloudflare 拦截（403）则自动降级到备用接口。
-func FetchIPPureInfo(
+type IPHealthConfig struct {
+	URL     string
+	Source  string
+	Parser  string
+	Timeout time.Duration
+}
+
+// FetchDefaultIPHealthInfo 使用传入的检测目标查询出口 IP 健康信息。
+// 返回值为第三方接口原始 JSON（map 形式），不做本地评分计算。
+func FetchDefaultIPHealthInfo(
 	proxyId string,
 	proxies []config.BrowserProxy,
 	xrayMgr *XrayManager,
 	singboxMgr *SingBoxManager,
 ) (map[string]interface{}, error) {
-	src := ""
-	for _, item := range proxies {
-		if strings.EqualFold(item.ProxyId, proxyId) {
-			src = strings.TrimSpace(item.ProxyConfig)
-			break
-		}
-	}
-	if src == "" {
-		return nil, fmt.Errorf("未找到代理配置")
-	}
-
-	client, err := buildIPPureHTTPClient(src, proxyId, proxies, xrayMgr, singboxMgr, 20*time.Second)
-	if err != nil {
-		return nil, err
-	}
-
-	// 先尝试 IPPure 主接口
-	data, primaryErr := fetchIPPure(client)
-	if primaryErr == nil {
-		return data, nil
-	}
-
-	// 若是 Cloudflare 拦截（403）则尝试备用接口
-	if isCloudflareBlock(primaryErr) {
-		var lastErr error
-		for _, ep := range fallbackEndpoints {
-			data, err := fetchFromEndpoint(client, ep)
-			if err == nil {
-				return data, nil
-			}
-			lastErr = err
-		}
-		if lastErr != nil {
-			return nil, fmt.Errorf("IPPure 被 Cloudflare 拦截，备用接口也失败: %w", lastErr)
-		}
-	}
-
-	return nil, primaryErr
+	return FetchIPHealthInfo(proxyId, proxies, xrayMgr, singboxMgr, nil, config.BrowserConnectorXray, nil)
 }
 
-func fetchIPPure(client *http.Client) (map[string]interface{}, error) {
-	req, err := http.NewRequest(http.MethodGet, defaultIPPureInfoURL, nil)
-	if err != nil {
-		return nil, fmt.Errorf("构建请求失败: %w", err)
+func FetchIPHealthInfo(
+	proxyId string,
+	proxies []config.BrowserProxy,
+	xrayMgr *XrayManager,
+	singboxMgr *SingBoxManager,
+	clashMgr *ClashManager,
+	connectorType string,
+	cfg *IPHealthConfig,
+) (map[string]interface{}, error) {
+	if cfg == nil {
+		cfg = &IPHealthConfig{}
 	}
-	req.Header.Set("Accept", "application/json, text/plain, */*")
-	req.Header.Set("Accept-Language", "en-US,en;q=0.9")
-	req.Header.Set("User-Agent", "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36")
-	req.Header.Set("Referer", "https://my.ippure.com/")
+	targetURL := strings.TrimSpace(cfg.URL)
+	if targetURL == "" {
+		targetURL = DefaultIPHealthURL
+	}
+	timeout := cfg.Timeout
+	if timeout <= 0 {
+		timeout = 20 * time.Second
+	}
+	source := resolveIPHealthSource(cfg, targetURL)
+	parser := resolveIPHealthParser(cfg.Parser)
+	meta := map[string]interface{}{
+		"_source":    source,
+		"_targetUrl": targetURL,
+		"_parser":    parser,
+	}
+	if targetURL == "" {
+		meta["error"] = "IP 健康检测目标 URL 为空"
+		return meta, fmt.Errorf("IP 健康检测目标 URL 为空")
+	}
+
+	src := resolveProxyConfig("", proxies, proxyId)
+	if src == "" {
+		meta["error"] = "未找到代理配置"
+		return meta, fmt.Errorf("未找到代理配置")
+	}
+
+	client, err := buildIPHealthHTTPClient(src, proxyId, proxies, xrayMgr, singboxMgr, clashMgr, connectorType, timeout)
+	if err != nil {
+		meta["error"] = err.Error()
+		return meta, fmt.Errorf("创建 IP 健康检测客户端失败（source=%s）: %w", source, err)
+	}
+
+	req, err := http.NewRequest(http.MethodGet, targetURL, nil)
+	if err != nil {
+		meta["error"] = err.Error()
+		return meta, fmt.Errorf("创建 IP 健康检测请求失败（source=%s）: %w", source, err)
+	}
+	if strings.Contains(strings.ToLower(targetURL), "ippure.com") {
+		req.Header.Set("Accept", "application/json, text/plain, */*")
+		req.Header.Set("Accept-Language", "en-US,en;q=0.9")
+		req.Header.Set("User-Agent", "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36")
+		req.Header.Set("Referer", "https://my.ippure.com/")
+	} else {
+		req.Header.Set("Accept", "application/json")
+		req.Header.Set("User-Agent", "AntChrome/1.0")
+	}
 
 	resp, err := client.Do(req)
+	var primaryErr error
+	var body []byte
 	if err != nil {
-		return nil, fmt.Errorf("调用 IPPure 接口失败: %w", err)
+		primaryErr = fmt.Errorf("调用 IP 健康检测接口失败（source=%s）: %w", source, err)
+	} else {
+		defer resp.Body.Close()
+		body, err = io.ReadAll(resp.Body)
+		if err != nil {
+			primaryErr = fmt.Errorf("读取 IP 健康检测响应失败（source=%s）: %w", source, err)
+		} else if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+			snippet := bodySnippet(body, 180)
+			primaryErr = fmt.Errorf("IP 健康检测 HTTP %d（source=%s）: %s", resp.StatusCode, source, snippet)
+			meta["_statusCode"] = resp.StatusCode
+			if snippet != "" {
+				meta["_bodySnippet"] = snippet
+			}
+		}
 	}
-	defer resp.Body.Close()
 
-	body, err := io.ReadAll(resp.Body)
+	// 如果主接口失败，检查是否需要自动降级到备用接口
+	isDefaultOrIPPure := strings.Contains(strings.ToLower(targetURL), "ippure.com") || targetURL == DefaultIPHealthURL
+	if primaryErr != nil {
+		if isDefaultOrIPPure && isCloudflareBlock(primaryErr) {
+			for _, ep := range fallbackEndpoints {
+				data, fallbackErr := fetchFromEndpoint(client, ep)
+				if fallbackErr == nil {
+					return data, nil
+				}
+			}
+		}
+		meta["error"] = primaryErr.Error()
+		return meta, primaryErr
+	}
+
+	result, err := parseIPHealthBody(body, cfg.Parser)
 	if err != nil {
-		return nil, fmt.Errorf("读取 IPPure 响应失败: %w", err)
+		snippet := bodySnippet(body, 180)
+		meta["error"] = err.Error()
+		if snippet != "" {
+			meta["_bodySnippet"] = snippet
+		}
+		return meta, fmt.Errorf("IP 健康检测响应解析失败（source=%s, parser=%s）: %w", source, parser, err)
 	}
-	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return nil, fmt.Errorf("IPPure HTTP %d: %s", resp.StatusCode, bodySnippet(body, 180))
-	}
+	result["_source"] = source
+	result["_targetUrl"] = targetURL
+	result["_parser"] = parser
+	return result, nil
+}
 
+func parseIPHealthBody(body []byte, parser string) (map[string]interface{}, error) {
+	if strings.EqualFold(strings.TrimSpace(parser), "cloudflare_trace") {
+		result := map[string]interface{}{}
+		for _, line := range strings.Split(string(body), "\n") {
+			key, value, ok := strings.Cut(strings.TrimSpace(line), "=")
+			if ok && strings.TrimSpace(key) != "" {
+				result[strings.TrimSpace(key)] = strings.TrimSpace(value)
+			}
+		}
+		if ip := mapString(result, "ip"); ip != "" {
+			result["ip"] = ip
+		}
+		return result, nil
+	}
 	var result map[string]interface{}
 	if err := json.Unmarshal(body, &result); err != nil {
-		return nil, fmt.Errorf("IPPure JSON 解析失败: %w", err)
+		return nil, err
 	}
 	return result, nil
 }
@@ -203,21 +273,63 @@ func isCloudflareBlock(err error) bool {
 		return false
 	}
 	msg := err.Error()
-	return strings.Contains(msg, "IPPure HTTP 403") &&
+	return (strings.Contains(msg, "HTTP 403") || strings.Contains(msg, "HTTP 503")) &&
 		(strings.Contains(msg, "Just a moment") ||
 			strings.Contains(msg, "Cloudflare") ||
-			strings.Contains(msg, "DOCTYPE html"))
+			strings.Contains(msg, "DOCTYPE html") ||
+			strings.Contains(msg, "<html"))
 }
 
-func buildIPPureHTTPClient(
+func mapString(data map[string]interface{}, key string) string {
+	value, ok := data[key]
+	if !ok || value == nil {
+		return ""
+	}
+	if text, ok := value.(string); ok {
+		return text
+	}
+	return fmt.Sprint(value)
+}
+
+func buildIPHealthHTTPClient(
 	src string,
 	proxyId string,
 	proxies []config.BrowserProxy,
 	xrayMgr *XrayManager,
 	singboxMgr *SingBoxManager,
+	clashMgr *ClashManager,
+	connectorType string,
 	timeout time.Duration,
 ) (*http.Client, error) {
-	return buildProxyHTTPClient(src, proxyId, proxies, xrayMgr, singboxMgr, timeout)
+	return buildProxyHTTPClient(src, proxyId, proxies, xrayMgr, singboxMgr, clashMgr, connectorType, timeout)
+}
+
+func resolveIPHealthSource(cfg *IPHealthConfig, targetURL string) string {
+	if cfg != nil {
+		if source := strings.TrimSpace(cfg.Source); source != "" {
+			return source
+		}
+		if parser := strings.TrimSpace(cfg.Parser); parser != "" {
+			return parser
+		}
+	}
+	if DefaultIPHealthURL != "" && strings.EqualFold(strings.TrimSpace(targetURL), DefaultIPHealthURL) {
+		return "ip_health"
+	}
+	if parsed, err := url.Parse(strings.TrimSpace(targetURL)); err == nil {
+		if host := strings.ToLower(strings.TrimSpace(parsed.Hostname())); host != "" {
+			return host
+		}
+	}
+	return "ip_health"
+}
+
+func resolveIPHealthParser(parser string) string {
+	normalized := strings.TrimSpace(parser)
+	if normalized == "" {
+		return "json"
+	}
+	return normalized
 }
 
 func bodySnippet(body []byte, max int) string {

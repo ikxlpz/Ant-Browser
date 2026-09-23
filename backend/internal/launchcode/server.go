@@ -2,18 +2,15 @@ package launchcode
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
-	"io"
 	"net"
 	"net/http"
-	"net/http/httputil"
-	"net/url"
 	"strconv"
 	"strings"
 	"sync"
 	"time"
 
+	"ant-chrome/backend/internal/automation"
 	"ant-chrome/backend/internal/browser"
 	"ant-chrome/backend/internal/logger"
 )
@@ -23,11 +20,18 @@ type BrowserStarter interface {
 	StartInstance(profileId string) (*browser.Profile, error)
 }
 
+// BrowserStatusProvider 可选接口：提供实例运行态查询。
+type BrowserStatusProvider interface {
+	StatusInstance(profileId string) (*browser.Profile, error)
+}
+
 // LaunchRequestParams 支持外部自动化透传的一次性启动参数
 type LaunchRequestParams struct {
 	LaunchArgs           []string `json:"launchArgs"`
 	StartURLs            []string `json:"startUrls"`
 	SkipDefaultStartURLs bool     `json:"skipDefaultStartUrls"`
+	ProxyId              string   `json:"proxyId"`
+	ProxyConfig          string   `json:"proxyConfig"`
 }
 
 // LaunchRequest POST /api/launch 的请求体
@@ -51,6 +55,36 @@ type BrowserStarterWithParams interface {
 	StartInstanceWithParams(profileId string, params LaunchRequestParams) (*browser.Profile, error)
 }
 
+// BrowserStopper 可选接口：支持停止运行中的实例。
+type BrowserStopper interface {
+	StopInstance(profileId string) (*browser.Profile, error)
+}
+
+// BrowserDebugWaiter 可选接口：等待实例调试端口进入可接管状态。
+type BrowserDebugWaiter interface {
+	WaitInstanceDebugReady(profileId string, debugPort int, timeout time.Duration) (*browser.Profile, bool, error)
+}
+
+// AutomationScriptLister 可选接口：提供自动化脚本列表。
+type AutomationScriptLister interface {
+	AutomationScriptList() ([]automation.ScriptRecord, error)
+}
+
+// AutomationScriptGetter 可选接口：提供单个自动化脚本详情。
+type AutomationScriptGetter interface {
+	AutomationScriptGet(scriptID string) (*automation.ScriptRecord, error)
+}
+
+// AutomationScriptRunner 可选接口：执行自动化脚本。
+type AutomationScriptRunner interface {
+	AutomationScriptRunWithOptions(input automation.ScriptRunRequest) (*automation.ScriptRunRecord, error)
+}
+
+// AutomationScriptRunLister 可选接口：提供自动化脚本运行记录。
+type AutomationScriptRunLister interface {
+	AutomationScriptRunList(limit int) ([]automation.ScriptRunRecord, error)
+}
+
 // LaunchCallRecord 接口调用记录
 type LaunchCallRecord struct {
 	Timestamp   string              `json:"timestamp"`
@@ -70,29 +104,33 @@ type LaunchCallRecord struct {
 
 // LaunchServer 本地 HTTP 唤起服务
 type LaunchServer struct {
-	service    *LaunchCodeService
-	starter    BrowserStarter
-	browserMgr *browser.Manager
-	port       int
-	server     *http.Server
-	mu         sync.Mutex
-	authMu     sync.RWMutex
-	logMu      sync.Mutex
-	callLogs   []LaunchCallRecord
-	activeMu   sync.RWMutex
-	activePort int
-	activeID   string
-	activeName string
-	apiAuth    APIAuthConfig
+	service     *LaunchCodeService
+	starter     BrowserStarter
+	browserMgr  *browser.Manager
+	port        int
+	server      *http.Server
+	mu          sync.Mutex
+	authMu      sync.RWMutex
+	logMu       sync.Mutex
+	callLogs    []LaunchCallRecord
+	taskMu      sync.Mutex
+	activeTasks map[string]*launchTaskState
+	nextTaskID  uint64
+	activeMu    sync.RWMutex
+	activePort  int
+	activeID    string
+	activeName  string
+	apiAuth     APIAuthConfig
 }
 
 // NewLaunchServer 创建 LaunchServer
 func NewLaunchServer(service *LaunchCodeService, starter BrowserStarter, mgr *browser.Manager, port int) *LaunchServer {
 	srv := &LaunchServer{
-		service:    service,
-		starter:    starter,
-		browserMgr: mgr,
-		port:       port,
+		service:     service,
+		starter:     starter,
+		browserMgr:  mgr,
+		port:        port,
+		activeTasks: make(map[string]*launchTaskState),
 	}
 	srv.SetAPIAuthConfig(APIAuthConfig{})
 	return srv
@@ -118,9 +156,9 @@ func (s *LaunchServer) Start() error {
 
 	log := logger.New("LaunchServer")
 	if preferredPort <= 0 {
-		log.Info("LaunchServer 使用随机端口", logger.F("port", port))
+		log.Debug("LaunchServer 使用随机端口", logger.F("port", port))
 	} else {
-		log.Info("LaunchServer 使用固定端口", logger.F("port", port))
+		log.Debug("LaunchServer 使用固定端口", logger.F("port", port))
 	}
 	auth := s.apiAuthConfig()
 	if auth.Active() {
@@ -137,27 +175,6 @@ func (s *LaunchServer) Start() error {
 	}()
 
 	return nil
-}
-
-func (s *LaunchServer) buildMux() *http.ServeMux {
-	mux := http.NewServeMux()
-	mux.HandleFunc("/api/health", s.handleHealth)
-	mux.HandleFunc("/api/profiles", s.handleProfiles)
-	mux.HandleFunc("/api/profiles/", s.handleProfileByID)
-	mux.HandleFunc("/api/launch", s.handleLaunchWithBody)
-	mux.HandleFunc("/api/launch/logs", s.handleLaunchLogs)
-	mux.HandleFunc("/api/launch/", s.handleLaunch)
-	mux.HandleFunc("/", s.handleCDPProxy)
-	return mux
-}
-
-func (s *LaunchServer) buildHandler(includeLocalhost bool) http.Handler {
-	var handler http.Handler = s.buildMux()
-	handler = s.apiAuthMiddleware(handler)
-	if includeLocalhost {
-		handler = s.localhostMiddleware(handler)
-	}
-	return handler
 }
 
 func bindLaunchListener(preferredPort int) (net.Listener, int, error) {
@@ -274,518 +291,8 @@ func (s *LaunchServer) activeTarget() (int, string, string) {
 	return s.activePort, s.activeID, s.activeName
 }
 
-// localhostMiddleware 只允许 127.0.0.1 访问
-func (s *LaunchServer) localhostMiddleware(next http.Handler) http.Handler {
-	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		host, _, err := net.SplitHostPort(r.RemoteAddr)
-		if err != nil || host != "127.0.0.1" {
-			writeJSON(w, http.StatusForbidden, map[string]interface{}{
-				"ok":    false,
-				"error": "forbidden: only localhost is allowed",
-			})
-			return
-		}
-		next.ServeHTTP(w, r)
-	})
-}
-
-// handleHealth GET /api/health
-func (s *LaunchServer) handleHealth(w http.ResponseWriter, r *http.Request) {
-	writeJSON(w, http.StatusOK, map[string]interface{}{"ok": true})
-}
-
-// handleCDPProxy 将统一端口上的非 /api 请求转发到当前活动实例的 CDP 端口。
-func (s *LaunchServer) handleCDPProxy(w http.ResponseWriter, r *http.Request) {
-	debugPort, profileID, profileName := s.activeTarget()
-	if debugPort <= 0 {
-		writeJSON(w, http.StatusServiceUnavailable, map[string]interface{}{
-			"ok":          false,
-			"error":       "no active browser debug target",
-			"profileId":   profileID,
-			"profileName": profileName,
-		})
-		return
-	}
-
-	target, err := url.Parse(fmt.Sprintf("http://127.0.0.1:%d", debugPort))
-	if err != nil {
-		http.Error(w, fmt.Sprintf("invalid cdp target: %v", err), http.StatusInternalServerError)
-		return
-	}
-
-	proxy := httputil.NewSingleHostReverseProxy(target)
-	proxy.ErrorHandler = func(w http.ResponseWriter, _ *http.Request, proxyErr error) {
-		http.Error(w, fmt.Sprintf("cdp proxy error: %v", proxyErr), http.StatusBadGateway)
-	}
-	proxy.ServeHTTP(w, r)
-}
-
-// handleLaunch GET /api/launch/{code}
-func (s *LaunchServer) handleLaunch(w http.ResponseWriter, r *http.Request) {
-	startAt := time.Now()
-	clientIP := remoteIP(r.RemoteAddr)
-	selector := LaunchSelector{}
-	if r.Method != http.MethodGet {
-		msg := "method not allowed"
-		writeJSON(w, http.StatusMethodNotAllowed, map[string]interface{}{
-			"ok":    false,
-			"error": msg,
-		})
-		s.appendLaunchLog(r.Method, r.URL.Path, clientIP, "", selector, LaunchRequestParams{}, false, http.StatusMethodNotAllowed, msg, "", "", startAt)
-		return
-	}
-
-	code := strings.TrimPrefix(r.URL.Path, "/api/launch/")
-	if strings.TrimSpace(code) == "" {
-		msg := "launch code not found"
-		writeJSON(w, http.StatusNotFound, map[string]interface{}{
-			"ok":    false,
-			"error": msg,
-		})
-		s.appendLaunchLog(r.Method, r.URL.Path, clientIP, "", selector, LaunchRequestParams{}, false, http.StatusNotFound, msg, "", "", startAt)
-		return
-	}
-
-	selector = normalizeLaunchSelector(LaunchSelector{Code: code})
-	profile, launchCode, status, errMsg := s.launchByCode(code, LaunchRequestParams{})
-	if errMsg != "" {
-		writeJSON(w, status, map[string]interface{}{
-			"ok":    false,
-			"error": errMsg,
-		})
-		s.appendLaunchLog(r.Method, r.URL.Path, clientIP, selector.Code, selector, LaunchRequestParams{}, false, status, errMsg, "", "", startAt)
-		return
-	}
-
-	s.SetActiveProfile(profile)
-	writeJSON(w, http.StatusOK, s.launchSuccessPayload(profile, launchCode))
-	s.appendLaunchLog(r.Method, r.URL.Path, clientIP, launchCode, selector, LaunchRequestParams{}, true, http.StatusOK, "", profile.ProfileId, profile.ProfileName, startAt)
-}
-
-func (s *LaunchServer) launchSuccessPayload(profile *browser.Profile, launchCode string) map[string]interface{} {
-	cdpURL := s.CDPURL()
-	cdpPort := s.Port()
-	if cdpURL == "" && profile != nil && profile.DebugReady && profile.DebugPort > 0 {
-		cdpPort = profile.DebugPort
-		cdpURL = fmt.Sprintf("http://127.0.0.1:%d", profile.DebugPort)
-	}
-
-	return map[string]interface{}{
-		"ok":             true,
-		"profileId":      profile.ProfileId,
-		"profileName":    profile.ProfileName,
-		"launchCode":     launchCode,
-		"pid":            profile.Pid,
-		"debugPort":      profile.DebugPort,
-		"debugReady":     profile.DebugReady,
-		"runtimeWarning": profile.RuntimeWarning,
-		"cdpPort":        cdpPort,
-		"cdpUrl":         cdpURL,
-	}
-}
-
-// handleLaunchWithBody POST /api/launch
-func (s *LaunchServer) handleLaunchWithBody(w http.ResponseWriter, r *http.Request) {
-	startAt := time.Now()
-	clientIP := remoteIP(r.RemoteAddr)
-	selector := LaunchSelector{}
-	if r.Method != http.MethodPost {
-		msg := "method not allowed"
-		writeJSON(w, http.StatusMethodNotAllowed, map[string]interface{}{
-			"ok":    false,
-			"error": msg,
-		})
-		s.appendLaunchLog(r.Method, r.URL.Path, clientIP, "", selector, LaunchRequestParams{}, false, http.StatusMethodNotAllowed, msg, "", "", startAt)
-		return
-	}
-
-	var req LaunchRequest
-	dec := json.NewDecoder(io.LimitReader(r.Body, 1<<20))
-	dec.DisallowUnknownFields()
-	if err := dec.Decode(&req); err != nil {
-		msg := "invalid request body"
-		writeJSON(w, http.StatusBadRequest, map[string]interface{}{
-			"ok":    false,
-			"error": msg,
-		})
-		s.appendLaunchLog(r.Method, r.URL.Path, clientIP, "", selector, LaunchRequestParams{}, false, http.StatusBadRequest, msg, "", "", startAt)
-		return
-	}
-
-	selector = mergeLaunchSelector(req)
-	if selector.IsEmpty() {
-		msg := "selector is required"
-		writeJSON(w, http.StatusBadRequest, map[string]interface{}{
-			"ok":    false,
-			"error": msg,
-		})
-		s.appendLaunchLog(r.Method, r.URL.Path, clientIP, "", selector, req.LaunchRequestParams, false, http.StatusBadRequest, msg, "", "", startAt)
-		return
-	}
-
-	req.LaunchArgs = normalizeStringSlice(req.LaunchArgs)
-	req.StartURLs = normalizeStringSlice(req.StartURLs)
-	if selector.MatchMode == launchMatchModeAll {
-		profiles, status, errMsg := s.launchAllBySelector(selector, req.LaunchRequestParams)
-		if errMsg != "" {
-			writeJSON(w, status, map[string]interface{}{
-				"ok":    false,
-				"error": errMsg,
-			})
-			s.appendLaunchLog(r.Method, r.URL.Path, clientIP, selector.Code, selector, req.LaunchRequestParams, false, status, errMsg, "", "", startAt)
-			return
-		}
-
-		activeProfile, profileIDs, profileNames := summarizeLaunchedProfiles(profiles)
-		if activeProfile != nil {
-			s.SetActiveProfile(activeProfile)
-		}
-		writeJSON(w, http.StatusOK, s.launchBatchSuccessPayload(profiles))
-		s.appendLaunchLog(r.Method, r.URL.Path, clientIP, selector.Code, selector, req.LaunchRequestParams, true, http.StatusOK, "", profileIDs, profileNames, startAt)
-		return
-	}
-
-	profile, launchCode, status, errMsg := s.launchBySelector(selector, req.LaunchRequestParams)
-	if errMsg != "" {
-		writeJSON(w, status, map[string]interface{}{
-			"ok":    false,
-			"error": errMsg,
-		})
-		s.appendLaunchLog(r.Method, r.URL.Path, clientIP, launchCode, selector, req.LaunchRequestParams, false, status, errMsg, "", "", startAt)
-		return
-	}
-
-	s.SetActiveProfile(profile)
-	writeJSON(w, http.StatusOK, s.launchSuccessPayload(profile, launchCode))
-	s.appendLaunchLog(r.Method, r.URL.Path, clientIP, launchCode, selector, req.LaunchRequestParams, true, http.StatusOK, "", profile.ProfileId, profile.ProfileName, startAt)
-}
-
-// handleLaunchLogs GET /api/launch/logs?limit=50
-func (s *LaunchServer) handleLaunchLogs(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodGet {
-		writeJSON(w, http.StatusMethodNotAllowed, map[string]interface{}{
-			"ok":    false,
-			"error": "method not allowed",
-		})
-		return
-	}
-
-	limit := 50
-	if raw := strings.TrimSpace(r.URL.Query().Get("limit")); raw != "" {
-		if n, err := strconv.Atoi(raw); err == nil {
-			if n < 1 {
-				n = 1
-			}
-			if n > 200 {
-				n = 200
-			}
-			limit = n
-		}
-	}
-
-	items := s.listLaunchLogs(limit)
-	writeJSON(w, http.StatusOK, map[string]interface{}{
-		"ok":    true,
-		"items": items,
-	})
-}
-
-func (s *LaunchServer) launchByCode(code string, params LaunchRequestParams) (*browser.Profile, string, int, string) {
-	return s.launchBySelectorInternal(normalizeLaunchSelector(LaunchSelector{Code: code}), params, false)
-}
-
-func (s *LaunchServer) launchBySelector(selector LaunchSelector, params LaunchRequestParams) (*browser.Profile, string, int, string) {
-	return s.launchBySelectorInternal(selector, params, true)
-}
-
-func (s *LaunchServer) launchProfile(profileID string, params LaunchRequestParams) (*browser.Profile, error) {
-	if starterWithParams, ok := s.starter.(BrowserStarterWithParams); ok {
-		profile, err := starterWithParams.StartInstanceWithParams(profileID, params)
-		return normalizeLaunchedProfileRuntime(profile), err
-	}
-	profile, err := s.starter.StartInstance(profileID)
-	return normalizeLaunchedProfileRuntime(profile), err
-}
-
-func normalizeLaunchedProfileRuntime(profile *browser.Profile) *browser.Profile {
-	if profile == nil {
-		return nil
-	}
-
-	// Backward compatibility: older starter implementations only filled pid/debugPort.
-	if !profile.Running && (profile.Pid > 0 || profile.DebugPort > 0) {
-		profile.Running = true
-	}
-	if !profile.DebugReady &&
-		profile.DebugPort > 0 &&
-		strings.TrimSpace(profile.RuntimeWarning) == "" &&
-		(profile.Running || profile.Pid > 0) {
-		profile.DebugReady = true
-	}
-
-	return profile
-}
-
-func (s *LaunchServer) launchBySelectorInternal(selector LaunchSelector, params LaunchRequestParams, allowCodeKeywordFallback bool) (*browser.Profile, string, int, string) {
-	var (
-		profileID  string
-		launchCode string
-		err        error
-	)
-
-	selector = normalizeLaunchSelector(selector)
-	if selector.IsEmpty() {
-		return nil, "", http.StatusBadRequest, "selector is required"
-	}
-	if err = selector.Validate(); err != nil {
-		return nil, "", http.StatusBadRequest, err.Error()
-	}
-	selector = s.withCodeKeywordFallback(selector, allowCodeKeywordFallback)
-
-	if selector.OnlyCode() {
-		profileID, err = s.service.Resolve(selector.Code)
-		if err != nil {
-			return nil, "", http.StatusNotFound, "launch code not found"
-		}
-		launchCode = selector.Code
-	} else {
-		profileSnapshot, status, errMsg := s.findProfileBySelector(selector)
-		if errMsg != "" {
-			if selector.Code != "" {
-				launchCode = selector.Code
-			}
-			return nil, launchCode, status, errMsg
-		}
-		profileID = profileSnapshot.ProfileId
-		launchCode = profileSnapshot.LaunchCode
-	}
-
-	profile, err := s.launchProfile(profileID, params)
-	if err != nil {
-		return nil, launchCode, http.StatusInternalServerError, err.Error()
-	}
-
-	if launchCode == "" && s.service != nil && profile != nil {
-		if code, codeErr := s.service.EnsureCode(profile.ProfileId); codeErr == nil {
-			launchCode = code
-		}
-	}
-	if profile != nil && launchCode != "" {
-		profile.LaunchCode = launchCode
-	}
-
-	return profile, launchCode, http.StatusOK, ""
-}
-
-func (s *LaunchServer) launchAllBySelector(selector LaunchSelector, params LaunchRequestParams) ([]*browser.Profile, int, string) {
-	selector = normalizeLaunchSelector(selector)
-	if selector.IsEmpty() {
-		return nil, http.StatusBadRequest, "selector is required"
-	}
-	if err := selector.Validate(); err != nil {
-		return nil, http.StatusBadRequest, err.Error()
-	}
-	selector = s.withCodeKeywordFallback(selector, true)
-
-	snapshots, status, errMsg := s.findProfilesBySelector(selector)
-	if errMsg != "" {
-		return nil, status, errMsg
-	}
-
-	profiles := make([]*browser.Profile, 0, len(snapshots))
-	for _, snapshot := range snapshots {
-		profile, err := s.launchProfile(snapshot.ProfileId, params)
-		if err != nil {
-			label := strings.TrimSpace(snapshot.ProfileName)
-			if label == "" {
-				label = snapshot.ProfileId
-			}
-			return profiles, http.StatusInternalServerError, fmt.Sprintf("failed to start profile %s after launching %d profile(s): %v", label, len(profiles), err)
-		}
-
-		launchCode := snapshot.LaunchCode
-		if launchCode == "" && s.service != nil && profile != nil {
-			if code, codeErr := s.service.EnsureCode(profile.ProfileId); codeErr == nil {
-				launchCode = code
-			}
-		}
-		if profile != nil && launchCode != "" {
-			profile.LaunchCode = launchCode
-		}
-
-		profiles = append(profiles, profile)
-	}
-
-	return profiles, http.StatusOK, ""
-}
-
-func (s *LaunchServer) withCodeKeywordFallback(selector LaunchSelector, allow bool) LaunchSelector {
-	if !allow || strings.TrimSpace(selector.Code) == "" {
-		return selector
-	}
-	if s.service != nil {
-		if _, err := s.service.Resolve(selector.Code); err == nil {
-			return selector
-		}
-	}
-
-	fallback := selector
-	if strings.TrimSpace(fallback.Key) == "" {
-		fallback.Key = selector.Code
-	}
-	fallback.Code = ""
-	return fallback
-}
-
-func (s *LaunchServer) launchBatchSuccessPayload(profiles []*browser.Profile) map[string]interface{} {
-	items := make([]map[string]interface{}, 0, len(profiles))
-	for i, profile := range profiles {
-		if profile == nil {
-			continue
-		}
-		item := map[string]interface{}{
-			"profileId":      profile.ProfileId,
-			"profileName":    profile.ProfileName,
-			"launchCode":     profile.LaunchCode,
-			"pid":            profile.Pid,
-			"debugPort":      profile.DebugPort,
-			"debugReady":     profile.DebugReady,
-			"runtimeWarning": profile.RuntimeWarning,
-			"isActive":       i == len(profiles)-1,
-		}
-		items = append(items, item)
-	}
-
-	activeProfile, _, _ := summarizeLaunchedProfiles(profiles)
-	cdpURL := s.CDPURL()
-	cdpPort := s.Port()
-	if cdpURL == "" && activeProfile != nil && activeProfile.DebugReady && activeProfile.DebugPort > 0 {
-		cdpPort = activeProfile.DebugPort
-		cdpURL = fmt.Sprintf("http://127.0.0.1:%d", activeProfile.DebugPort)
-	}
-
-	payload := map[string]interface{}{
-		"ok":        true,
-		"matchMode": launchMatchModeAll,
-		"count":     len(items),
-		"items":     items,
-		"cdpPort":   cdpPort,
-		"cdpUrl":    cdpURL,
-	}
-	if activeProfile != nil {
-		payload["activeProfileId"] = activeProfile.ProfileId
-		payload["activeProfileName"] = activeProfile.ProfileName
-	}
-	return payload
-}
-
-func summarizeLaunchedProfiles(profiles []*browser.Profile) (*browser.Profile, string, string) {
-	if len(profiles) == 0 {
-		return nil, "", ""
-	}
-
-	ids := make([]string, 0, len(profiles))
-	names := make([]string, 0, len(profiles))
-	var active *browser.Profile
-	for _, profile := range profiles {
-		if profile == nil {
-			continue
-		}
-		active = profile
-		ids = append(ids, profile.ProfileId)
-		if trimmed := strings.TrimSpace(profile.ProfileName); trimmed != "" {
-			names = append(names, trimmed)
-		}
-	}
-	return active, strings.Join(ids, ","), strings.Join(names, ",")
-}
-
-// writeJSON 写入 JSON 响应
-func writeJSON(w http.ResponseWriter, status int, v interface{}) {
-	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(status)
-	_ = json.NewEncoder(w).Encode(v)
-}
-
-// NewTestHandler 返回不含 localhost 限制的 handler，仅供测试使用
-func NewTestHandler(s *LaunchServer) http.Handler {
-	return s.buildHandler(false)
-}
-
-func normalizeStringSlice(items []string) []string {
-	if len(items) == 0 {
-		return nil
-	}
-	out := make([]string, 0, len(items))
-	for _, item := range items {
-		v := strings.TrimSpace(item)
-		if v != "" {
-			out = append(out, v)
-		}
-	}
-	if len(out) == 0 {
-		return nil
-	}
-	return out
-}
-
-func (s *LaunchServer) appendLaunchLog(method, path, clientIP, code string, selector LaunchSelector, params LaunchRequestParams, ok bool, status int, errMsg, profileID, profileName string, startAt time.Time) {
-	entry := LaunchCallRecord{
-		Timestamp:   time.Now().Format(time.RFC3339),
-		Method:      method,
-		Path:        path,
-		ClientIP:    clientIP,
-		Code:        strings.TrimSpace(code),
-		Selector:    selector,
-		ProfileID:   profileID,
-		ProfileName: profileName,
-		Params:      params,
-		OK:          ok,
-		Status:      status,
-		Error:       errMsg,
-		DurationMs:  time.Since(startAt).Milliseconds(),
-	}
-
-	s.logMu.Lock()
-	s.callLogs = append(s.callLogs, entry)
-	if len(s.callLogs) > 500 {
-		s.callLogs = append([]LaunchCallRecord(nil), s.callLogs[len(s.callLogs)-500:]...)
-	}
-	s.logMu.Unlock()
-
-	log := logger.New("LaunchServer")
-	if ok {
-		log.Info("Launch API 调用", logger.F("method", method), logger.F("path", path), logger.F("code", entry.Code), logger.F("profile_id", profileID), logger.F("status", status), logger.F("duration_ms", entry.DurationMs))
-		return
-	}
-	log.Warn("Launch API 调用失败", logger.F("method", method), logger.F("path", path), logger.F("code", entry.Code), logger.F("status", status), logger.F("error", errMsg), logger.F("duration_ms", entry.DurationMs))
-}
-
-func (s *LaunchServer) listLaunchLogs(limit int) []LaunchCallRecord {
-	s.logMu.Lock()
-	defer s.logMu.Unlock()
-
-	if limit <= 0 {
-		limit = 50
-	}
-	if limit > len(s.callLogs) {
-		limit = len(s.callLogs)
-	}
-	if limit == 0 {
-		return []LaunchCallRecord{}
-	}
-
-	out := make([]LaunchCallRecord, 0, limit)
-	for i := len(s.callLogs) - 1; i >= 0 && len(out) < limit; i-- {
-		out = append(out, s.callLogs[i])
-	}
-	return out
-}
-
-func remoteIP(remoteAddr string) string {
-	host, _, err := net.SplitHostPort(remoteAddr)
-	if err != nil {
-		return remoteAddr
-	}
-	return host
+// ActiveProfile 返回当前统一 CDP 入口对应的实例信息。
+func (s *LaunchServer) ActiveProfile() (string, string, int) {
+	port, profileID, profileName := s.activeTarget()
+	return profileID, profileName, port
 }

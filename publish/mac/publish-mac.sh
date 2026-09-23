@@ -202,7 +202,7 @@ if [[ "$SKIP_BUILD" -ne 1 ]]; then
   (cd "$ROOT_DIR/frontend" && npm ci --prefer-offline --no-audit --no-fund)
 
   echo "[2/4] Building frontend assets..."
-  (cd "$ROOT_DIR/frontend" && npm run build)
+  (cd "$ROOT_DIR/frontend" && npm run build:clean)
 
   echo "[3/4] Building macOS app bundle with Wails..."
   (

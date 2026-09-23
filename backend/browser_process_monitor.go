@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"io"
 	"net/url"
+	"os"
 	"os/exec"
 	"strconv"
 	"strings"
@@ -25,6 +26,7 @@ type browserProcessMonitor struct {
 	cmd        *exec.Cmd
 	stderr     io.ReadCloser
 	stderrTail *tailTextBuffer
+	stderrInit chan struct{}
 	stderrDone chan struct{}
 	waitDone   chan struct{}
 
@@ -47,13 +49,21 @@ func newBrowserProcessMonitor(cmd *exec.Cmd) (*browserProcessMonitor, error) {
 		cmd:        cmd,
 		stderr:     stderr,
 		stderrTail: newTailTextBuffer(browserStderrTailMaxLines, browserStderrTailMaxBytes),
+		stderrInit: make(chan struct{}),
 		stderrDone: make(chan struct{}),
 		waitDone:   make(chan struct{}),
 	}, nil
 }
 
+func newDetachedBrowserProcessMonitor() *browserProcessMonitor {
+	waitDone := make(chan struct{})
+	close(waitDone)
+	return &browserProcessMonitor{waitDone: waitDone}
+}
+
 func (m *browserProcessMonitor) Start() {
 	go m.captureStderr()
+	<-m.stderrInit
 	go m.waitForExit()
 }
 
@@ -107,12 +117,14 @@ func (m *browserProcessMonitor) captureStderr() {
 	defer close(m.stderrDone)
 
 	if m.stderr == nil {
+		close(m.stderrInit)
 		return
 	}
 	defer m.stderr.Close()
 
 	scanner := bufio.NewScanner(m.stderr)
 	scanner.Buffer(make([]byte, 0, 64*1024), 1024*1024)
+	close(m.stderrInit)
 	for scanner.Scan() {
 		line := scanner.Text()
 		m.stderrTail.Append(line)
@@ -120,9 +132,22 @@ func (m *browserProcessMonitor) captureStderr() {
 			m.SetDebugPort(port)
 		}
 	}
-	if err := scanner.Err(); err != nil {
+	if err := scanner.Err(); err != nil && !shouldIgnoreBrowserStderrReadError(err) {
 		m.stderrTail.Append(fmt.Sprintf("[stderr read error] %v", err))
 	}
+}
+
+func shouldIgnoreBrowserStderrReadError(err error) bool {
+	if err == nil {
+		return false
+	}
+	if err == io.EOF || err == os.ErrClosed {
+		return true
+	}
+
+	message := strings.ToLower(strings.TrimSpace(err.Error()))
+	return strings.Contains(message, "file already closed") ||
+		strings.Contains(message, "handle is invalid")
 }
 
 func (m *browserProcessMonitor) waitForExit() {

@@ -2,16 +2,18 @@ package proxy
 
 import (
 	"context"
+	"errors"
 	"fmt"
-	"net"
 	"net/http"
-	"net/netip"
+	"os"
+	"path/filepath"
+	"strconv"
 	"strings"
 	"time"
 
 	"github.com/metacubex/mihomo/adapter"
+	"github.com/metacubex/mihomo/common/utils"
 	C "github.com/metacubex/mihomo/constant"
-	"gopkg.in/yaml.v3"
 
 	"ant-chrome/backend/internal/config"
 	"ant-chrome/backend/internal/logger"
@@ -20,30 +22,56 @@ import (
 // ─── Clash 标准测速 URL ───
 // 使用 HTTP 与 Clash 客户端保持一致
 
-const defaultTestURL = "http://www.gstatic.com/generate_204"
+const DefaultSpeedTestURL = "http://www.gstatic.com/generate_204"
 
 // SpeedTestConfig 测速参数
 type SpeedTestConfig struct {
-	Timeout    time.Duration
-	TCPTimeout time.Duration
-	URLs       []string
+	Timeout        time.Duration
+	TCPTimeout     time.Duration
+	URLs           []string
+	ExpectedStatus []int
 }
 
 var DefaultSpeedTestConfig = SpeedTestConfig{
-	Timeout:    10 * time.Second,
-	TCPTimeout: 5 * time.Second,
+	Timeout:    3 * time.Second,
+	TCPTimeout: 3 * time.Second,
 }
 
 // ─── 对外入口 ───
 
-// SpeedTest 使用 mihomo 代理适配器进行测速。
-// 采用 unified-delay 策略：先建立连接（预热），再单独计时 HTTP 往返，
-// 与 Clash 客户端 unified-delay: true 的延迟结果一致。
+// SpeedTest 按单个代理的内核决策执行轻量 HTTP 延迟测试。
 func SpeedTest(
 	proxyId string,
 	proxies []config.BrowserProxy,
 	xrayMgr *XrayManager,
 	singboxMgr *SingBoxManager,
+	cfg *SpeedTestConfig,
+) TestResult {
+	return SpeedTestWithConnector(proxyId, proxies, xrayMgr, singboxMgr, nil, config.BrowserConnectorXray, cfg)
+}
+
+// SpeedTestWithConnector 保留 connectorType 参数用于旧调用兼容。
+// 实际测速内核由 ResolveProxyKernel 按单个代理决定。
+func SpeedTestWithConnector(
+	proxyId string,
+	proxies []config.BrowserProxy,
+	xrayMgr *XrayManager,
+	singboxMgr *SingBoxManager,
+	clashMgr *ClashManager,
+	connectorType string,
+	cfg *SpeedTestConfig,
+) TestResult {
+	connectorType = config.NormalizeBrowserConnectorType(connectorType)
+	return lightHTTPDelayTestWithConnector(proxyId, proxies, xrayMgr, singboxMgr, clashMgr, connectorType, cfg)
+}
+
+func lightHTTPDelayTestWithConnector(
+	proxyId string,
+	proxies []config.BrowserProxy,
+	xrayMgr *XrayManager,
+	singboxMgr *SingBoxManager,
+	clashMgr *ClashManager,
+	connectorType string,
 	cfg *SpeedTestConfig,
 ) TestResult {
 	log := logger.New("SpeedTest")
@@ -53,288 +81,290 @@ func SpeedTest(
 		cfg = &c
 	}
 
-	// 查找代理配置
-	src := ""
-	for _, item := range proxies {
-		if strings.EqualFold(item.ProxyId, proxyId) {
-			src = strings.TrimSpace(item.ProxyConfig)
-			break
-		}
-	}
+	src := resolveProxyConfig("", proxies, proxyId)
 	if src == "" {
-		return TestResult{ProxyId: proxyId, Ok: false, Error: "代理配置为空"}
+		return TestResult{ProxyId: proxyId, Ok: false, Engine: connectorType, Error: "代理配置为空"}
 	}
 
 	if strings.ToLower(src) == "direct://" {
-		return TestResult{ProxyId: proxyId, Ok: true, LatencyMs: 0}
+		return TestResult{ProxyId: proxyId, Ok: true, LatencyMs: 0, Engine: "direct"}
 	}
 
-	testURL := defaultTestURL
-	if len(cfg.URLs) > 0 {
-		testURL = cfg.URLs[0]
+	testURLs := speedTestTargetURLs(cfg)
+	if len(testURLs) == 0 {
+		return TestResult{ProxyId: proxyId, Ok: false, Engine: connectorType, Error: "测速目标 URL 为空"}
 	}
+	engine := speedTestProbeEngine(src, proxies, proxyId, connectorType)
+	log.Info("开始代理测速",
+		logger.F("proxy_id", proxyId),
+		logger.F("engine", engine),
+		logger.F("timeout_ms", cfg.Timeout.Milliseconds()),
+		logger.F("tcp_timeout_ms", cfg.TCPTimeout.Milliseconds()),
+		logger.F("targets", strings.Join(testURLs, ",")),
+	)
 
-	resolvedSrc := src
-	if IsChainSocks5Proxy(src) {
-		if xrayMgr == nil {
-			log.Warn("链式代理测速缺少 Xray 管理器，降级到 TCP ping",
-				logger.F("proxy_id", proxyId),
-			)
-			return tcpPingFallback(proxyId, src, cfg.TCPTimeout, log)
-		}
-		bridgeSocksURL, bridgeErr := xrayMgr.EnsureBridge(src, proxies, proxyId)
-		if bridgeErr != nil {
-			log.Warn("链式代理桥接失败，降级到 TCP ping",
-				logger.F("proxy_id", proxyId),
-				logger.F("error", bridgeErr.Error()),
-			)
-			return tcpPingFallback(proxyId, src, cfg.TCPTimeout, log)
-		}
-		resolvedSrc = strings.TrimSpace(bridgeSocksURL)
-	}
-
-	// 将代理配置转换为 mihomo mapping
-	mapping, err := proxyConfigToMapping(resolvedSrc)
+	client, err := buildSpeedTestHTTPClient(src, proxyId, proxies, xrayMgr, singboxMgr, clashMgr, connectorType, cfg)
 	if err != nil {
-		log.Warn("代理配置解析失败，降级到 TCP ping",
+		log.Warn("代理测速 HTTP 客户端创建失败",
 			logger.F("proxy_id", proxyId),
 			logger.F("error", err.Error()),
 		)
-		return tcpPingFallback(proxyId, resolvedSrc, cfg.TCPTimeout, log)
+		return TestResult{ProxyId: proxyId, Ok: false, Engine: engine, Error: err.Error()}
 	}
 
-	// 使用 mihomo adapter.ParseProxy 创建代理实例
-	proxyInstance, err := adapter.ParseProxy(mapping)
-	if err != nil {
-		log.Warn("mihomo 代理创建失败，降级到 TCP ping",
+	var lastErr error
+	var lastLatency int64
+	for _, testURL := range testURLs {
+		latency, statusCode, err := doSpeedTestRequest(client, testURL)
+		lastLatency = latency
+		if err != nil {
+			lastErr = err
+			log.Warn("代理测速请求失败",
+				logger.F("proxy_id", proxyId),
+				logger.F("engine", engine),
+				logger.F("url", testURL),
+				logger.F("latency_ms", latency),
+				logger.F("error", err.Error()),
+			)
+			continue
+		}
+		if speedTestStatusOK(statusCode, cfg) {
+			log.Info("代理测速成功",
+				logger.F("proxy_id", proxyId),
+				logger.F("engine", engine),
+				logger.F("url", testURL),
+				logger.F("status", statusCode),
+				logger.F("latency_ms", latency),
+			)
+			return TestResult{ProxyId: proxyId, Ok: true, LatencyMs: latency, Engine: engine}
+		}
+		lastErr = fmt.Errorf("HTTP %d", statusCode)
+		log.Warn("代理测速状态码不符合预期",
 			logger.F("proxy_id", proxyId),
-			logger.F("error", err.Error()),
-			logger.F("type", mapping["type"]),
+			logger.F("engine", engine),
+			logger.F("url", testURL),
+			logger.F("status", statusCode),
+			logger.F("latency_ms", latency),
 		)
-		return tcpPingFallback(proxyId, resolvedSrc, cfg.TCPTimeout, log)
 	}
 
-	// unified-delay 测速：分离连接建立和 HTTP 往返计时
-	return unifiedDelayTest(proxyId, proxyInstance, testURL, cfg.Timeout)
+	if lastErr != nil {
+		errorMessage := lastErr.Error()
+		if runtimeError := speedTestRuntimeError(engine, src, proxies, proxyId, xrayMgr); runtimeError != "" {
+			errorMessage = runtimeError
+		}
+		log.Warn("代理测速失败",
+			logger.F("proxy_id", proxyId),
+			logger.F("engine", engine),
+			logger.F("latency_ms", lastLatency),
+			logger.F("error", errorMessage),
+		)
+		return TestResult{ProxyId: proxyId, Ok: false, LatencyMs: lastLatency, Engine: engine, Error: errorMessage}
+	}
+	log.Warn("代理测速失败", logger.F("proxy_id", proxyId), logger.F("engine", engine), logger.F("error", "测速失败"))
+	return TestResult{ProxyId: proxyId, Ok: false, LatencyMs: lastLatency, Engine: engine, Error: "测速失败"}
 }
 
-// unifiedDelayTest 模拟 Clash unified-delay 模式：
-// 1. 通过代理建立到目标的 TCP 连接（预热，不计入延迟）
-// 2. 发送第一次 HTTP 请求预热连接（不计入延迟）
-// 3. 在已建立的连接上发送第二次 HTTP 请求，只计这次的 RTT
-// 这样测出的延迟 = 纯 HTTP 往返时间，和 Clash unified-delay: true 一致。
-func unifiedDelayTest(proxyId string, px C.Proxy, testURL string, timeout time.Duration) TestResult {
+func buildSpeedTestHTTPClient(
+	src string,
+	proxyId string,
+	proxies []config.BrowserProxy,
+	xrayMgr *XrayManager,
+	singboxMgr *SingBoxManager,
+	clashMgr *ClashManager,
+	connectorType string,
+	cfg *SpeedTestConfig,
+) (*http.Client, error) {
+	timeout := DefaultSpeedTestConfig.Timeout
+	prepareTimeout := DefaultSpeedTestConfig.TCPTimeout
+	if cfg != nil {
+		if cfg.Timeout > 0 {
+			timeout = cfg.Timeout
+		}
+		if cfg.TCPTimeout > 0 {
+			prepareTimeout = cfg.TCPTimeout
+		}
+	}
+	if prepareTimeout <= 0 {
+		prepareTimeout = timeout
+	}
+
+	type clientResult struct {
+		client *http.Client
+		err    error
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), prepareTimeout)
+	defer cancel()
+	resultCh := make(chan clientResult, 1)
+	go func() {
+		client, err := buildProxyHTTPClientContext(ctx, src, proxyId, proxies, xrayMgr, singboxMgr, clashMgr, connectorType, timeout)
+		resultCh <- clientResult{client: client, err: err}
+	}()
+
+	select {
+	case result := <-resultCh:
+		if result.err != nil && errors.Is(result.err, context.DeadlineExceeded) {
+			return nil, fmt.Errorf("代理准备超时（%dms）", prepareTimeout.Milliseconds())
+		}
+		return result.client, result.err
+	case <-ctx.Done():
+		return nil, fmt.Errorf("代理准备超时（%dms）", prepareTimeout.Milliseconds())
+	}
+}
+
+func primarySpeedTestURL(cfg *SpeedTestConfig) string {
+	if cfg != nil {
+		if urls := normalizeSpeedTestURLs(cfg.URLs); len(urls) > 0 {
+			return urls[0]
+		}
+	}
+	return strings.TrimSpace(DefaultSpeedTestURL)
+}
+
+func speedTestTargetURLs(cfg *SpeedTestConfig) []string {
+	if cfg != nil {
+		if urls := uniqueSpeedTestURLs(cfg.URLs); len(urls) > 0 {
+			return urls
+		}
+	}
+	return []string{DefaultSpeedTestURL}
+}
+
+func speedTestProbeEngine(src string, proxies []config.BrowserProxy, proxyId string, connectorType string) string {
+	resolution, err := ResolveProxyKernelForConnector(src, proxies, proxyId, connectorType)
+	if err != nil {
+		if resolution.Kernel != "" {
+			return resolution.Kernel
+		}
+		return config.NormalizeBrowserConnectorType(connectorType)
+	}
+	if resolution.Kernel == ProxyKernelNative {
+		return "native"
+	}
+	return resolution.Kernel
+}
+
+func speedTestRuntimeError(engine string, src string, proxies []config.BrowserProxy, proxyId string, xrayMgr *XrayManager) string {
+	if engine != ProxyKernelXray || xrayMgr == nil {
+		return ""
+	}
+	dnsServers := ""
+	if proxyId != "" {
+		for _, item := range proxies {
+			if strings.EqualFold(item.ProxyId, proxyId) {
+				dnsServers = item.DnsServers
+				break
+			}
+		}
+	}
+	key := computeNodeKey(normalizeNodeScheme(src) + "\x00" + dnsServers)
+	return latestXrayErrorSummary(filepath.Join(xrayMgr.resolveWorkdir(key), "xray-error.log"))
+}
+
+func latestXrayErrorSummary(path string) string {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return ""
+	}
+	lines := strings.Split(strings.TrimSpace(string(data)), "\n")
+	for i := len(lines) - 1; i >= 0; i-- {
+		line := strings.TrimSpace(lines[i])
+		if line == "" || !strings.Contains(line, "[Error]") {
+			continue
+		}
+		if idx := strings.Index(line, "[Error]"); idx >= 0 {
+			line = strings.TrimSpace(line[idx+len("[Error]"):])
+		}
+		if len([]rune(line)) > 240 {
+			line = string([]rune(line)[:240]) + "..."
+		}
+		return "xray 转发失败: " + line
+	}
+	return ""
+}
+
+func doSpeedTestRequest(client *http.Client, testURL string) (int64, int, error) {
+	latency, statusCode, err := doSpeedTestRequestWithMethod(client, http.MethodHead, testURL)
+	if err != nil || statusCode != http.StatusMethodNotAllowed {
+		if err != nil {
+			return latency, statusCode, err
+		}
+		secondLatency, secondStatusCode, secondErr := doSpeedTestRequestWithMethod(client, http.MethodHead, testURL)
+		if secondErr == nil {
+			return secondLatency, secondStatusCode, nil
+		}
+		return latency, statusCode, nil
+	}
+	return doSpeedTestRequestWithMethod(client, http.MethodGet, testURL)
+}
+
+func doSpeedTestRequestWithMethod(client *http.Client, method string, testURL string) (int64, int, error) {
+	start := time.Now()
+	req, err := http.NewRequest(method, testURL, nil)
+	if err != nil {
+		return 0, 0, fmt.Errorf("测速请求创建失败: %w", err)
+	}
+	resp, err := client.Do(req)
+	latency := time.Since(start).Milliseconds()
+	if err != nil {
+		return latency, 0, err
+	}
+	_ = resp.Body.Close()
+	return latency, resp.StatusCode, nil
+}
+
+func speedTestStatusOK(statusCode int, cfg *SpeedTestConfig) bool {
+	if cfg != nil && len(cfg.ExpectedStatus) > 0 {
+		for _, expected := range cfg.ExpectedStatus {
+			if statusCode == expected {
+				return true
+			}
+		}
+		return false
+	}
+	return isSpeedTestSuccessStatus(statusCode)
+}
+
+func mihomoURLTest(proxyId string, proxyInstance C.Proxy, testURL string, cfg *SpeedTestConfig) TestResult {
+	timeout := DefaultSpeedTestConfig.Timeout
+	if cfg != nil && cfg.Timeout > 0 {
+		timeout = cfg.Timeout
+	}
+
+	expectedStatus, err := speedTestExpectedStatus(cfg)
+	if err != nil {
+		return TestResult{ProxyId: proxyId, Ok: false, Engine: "mihomo", Error: err.Error()}
+	}
+
+	adapter.UnifiedDelay.Store(true)
 	ctx, cancel := context.WithTimeout(context.Background(), timeout)
 	defer cancel()
 
-	// 解析目标地址
-	addr, err := urlToMeta(testURL)
-	if err != nil {
-		return TestResult{ProxyId: proxyId, Ok: false, Error: fmt.Sprintf("URL 解析失败: %v", err)}
+	delay, err := proxyInstance.URLTest(ctx, testURL, expectedStatus)
+	latency := int64(delay)
+	if ctx.Err() != nil {
+		return TestResult{ProxyId: proxyId, Ok: false, LatencyMs: latency, Engine: "mihomo", Error: "测速超时"}
 	}
-
-	// 步骤 1：通过代理 DialContext 建立连接（预热）
-	conn, err := px.DialContext(ctx, &addr)
-	if err != nil {
-		return TestResult{ProxyId: proxyId, Ok: false, Error: fmt.Sprintf("代理连接失败: %v", err)}
-	}
-	defer conn.Close()
-
-	// 构造复用此连接的 HTTP client
-	transport := &http.Transport{
-		DialContext: func(context.Context, string, string) (net.Conn, error) {
-			return conn, nil
-		},
-		DisableKeepAlives: false,
-	}
-	client := &http.Client{
-		Transport: transport,
-		Timeout:   timeout,
-		CheckRedirect: func(req *http.Request, via []*http.Request) error {
-			return http.ErrUseLastResponse
-		},
-	}
-	defer client.CloseIdleConnections()
-
-	// 步骤 2：第一次请求预热（不计时）
-	req1, _ := http.NewRequestWithContext(ctx, http.MethodHead, testURL, nil)
-	resp1, err := client.Do(req1)
-	if err != nil {
-		return TestResult{ProxyId: proxyId, Ok: false, Error: err.Error()}
-	}
-	resp1.Body.Close()
-
-	// 步骤 3：第二次请求计时（纯 HTTP RTT）
-	start := time.Now()
-	req2, _ := http.NewRequestWithContext(ctx, http.MethodHead, testURL, nil)
-	resp2, err := client.Do(req2)
-	latency := time.Since(start).Milliseconds()
-
-	if err != nil {
-		return TestResult{ProxyId: proxyId, Ok: false, LatencyMs: latency, Error: err.Error()}
-	}
-	resp2.Body.Close()
-
-	if resp2.StatusCode != http.StatusOK && resp2.StatusCode != http.StatusNoContent {
-		return TestResult{ProxyId: proxyId, Ok: false, LatencyMs: latency,
-			Error: fmt.Sprintf("HTTP %d", resp2.StatusCode)}
-	}
-
-	return TestResult{ProxyId: proxyId, Ok: true, LatencyMs: latency}
-}
-
-// urlToMeta 将 URL 转换为 mihomo Metadata
-func urlToMeta(rawURL string) (C.Metadata, error) {
-	var host string
-	var portNum uint16
-	if strings.HasPrefix(rawURL, "https://") {
-		host = rawURL[len("https://"):]
-		portNum = 443
-	} else if strings.HasPrefix(rawURL, "http://") {
-		host = rawURL[len("http://"):]
-		portNum = 80
-	} else {
-		return C.Metadata{}, fmt.Errorf("不支持的 URL scheme")
-	}
-	// 去掉 path
-	if idx := strings.Index(host, "/"); idx >= 0 {
-		host = host[:idx]
-	}
-	// 检查是否有自定义端口
-	if h, p, err := net.SplitHostPort(host); err == nil {
-		host = h
-		fmt.Sscanf(p, "%d", &portNum)
-	}
-
-	meta := C.Metadata{
-		Host:    host,
-		DstPort: portNum,
-	}
-	if addr, err := netip.ParseAddr(host); err == nil {
-		meta.DstIP = addr
-	}
-	return meta, nil
-}
-
-// ─── 代理配置转换为 mihomo mapping ───
-
-func proxyConfigToMapping(src string) (map[string]any, error) {
-	src = strings.TrimSpace(src)
-	l := strings.ToLower(src)
-
-	// http/https 直连代理
-	if strings.HasPrefix(l, "http://") || strings.HasPrefix(l, "https://") {
-		return parseStandardProxy(src, "http")
-	}
-	// socks5 直连代理
-	if strings.HasPrefix(l, "socks5://") {
-		return parseStandardProxy(src, "socks5")
-	}
-
-	// URI 格式（vmess:// vless:// 等）暂不支持直接转 mapping，降级
-	if strings.Contains(l, "://") && !strings.Contains(l, "type:") {
-		return nil, fmt.Errorf("URI 格式暂不支持: %s", l[:min(30, len(l))])
-	}
-
-	// Clash YAML 格式 → 直接解析
-	return parseClashYAMLToMapping(src)
-}
-
-func parseStandardProxy(src string, proxyType string) (map[string]any, error) {
-	rest := src[strings.Index(src, "://")+3:]
-
-	var username, password, hostport string
-	if atIdx := strings.LastIndex(rest, "@"); atIdx >= 0 {
-		userInfo := rest[:atIdx]
-		hostport = rest[atIdx+1:]
-		parts := strings.SplitN(userInfo, ":", 2)
-		username = parts[0]
-		if len(parts) > 1 {
-			password = parts[1]
+	if err != nil || delay == 0 {
+		if err != nil {
+			return TestResult{ProxyId: proxyId, Ok: false, LatencyMs: latency, Engine: "mihomo", Error: err.Error()}
 		}
-	} else {
-		hostport = rest
-	}
-	hostport = strings.SplitN(hostport, "/", 2)[0]
-
-	host, port := splitHostPort(hostport)
-	if host == "" || port == 0 {
-		return nil, fmt.Errorf("无法解析地址: %s", src)
+		return TestResult{ProxyId: proxyId, Ok: false, LatencyMs: latency, Engine: "mihomo", Error: "mihomo 延迟测试无结果"}
 	}
 
-	mapping := map[string]any{
-		"name":   "speedtest-proxy",
-		"type":   proxyType,
-		"server": host,
-		"port":   port,
-	}
-	if username != "" {
-		mapping["username"] = username
-		mapping["password"] = password
-	}
-	return mapping, nil
+	return TestResult{ProxyId: proxyId, Ok: true, LatencyMs: latency, Engine: "mihomo"}
 }
 
-func parseClashYAMLToMapping(src string) (map[string]any, error) {
-	var payload interface{}
-	if err := yaml.Unmarshal([]byte(src), &payload); err != nil {
-		return nil, fmt.Errorf("YAML 解析失败: %v", err)
+func speedTestExpectedStatus(cfg *SpeedTestConfig) (utils.IntRanges[uint16], error) {
+	if cfg == nil || len(cfg.ExpectedStatus) == 0 {
+		return nil, nil
 	}
-
-	node := pickClashNode(payload)
-	if node == nil {
-		return nil, fmt.Errorf("无法提取 Clash 节点")
-	}
-
-	if _, ok := node["name"]; !ok {
-		node["name"] = "speedtest-proxy"
-	}
-
-	return node, nil
-}
-
-func splitHostPort(hostport string) (string, int) {
-	if strings.HasPrefix(hostport, "[") {
-		if idx := strings.LastIndex(hostport, "]:"); idx >= 0 {
-			host := hostport[1:idx]
-			port := 0
-			fmt.Sscanf(hostport[idx+2:], "%d", &port)
-			return host, port
+	items := make([]string, 0, len(cfg.ExpectedStatus))
+	for _, status := range cfg.ExpectedStatus {
+		if status <= 0 || status > 65535 {
+			return nil, fmt.Errorf("无效测速状态码: %d", status)
 		}
-		return strings.Trim(hostport, "[]"), 0
+		items = append(items, strconv.Itoa(status))
 	}
-	idx := strings.LastIndex(hostport, ":")
-	if idx < 0 {
-		return hostport, 0
-	}
-	host := hostport[:idx]
-	port := 0
-	fmt.Sscanf(hostport[idx+1:], "%d", &port)
-	return host, port
-}
-
-// ─── TCP Ping 降级 ───
-
-func tcpPingFallback(proxyId, src string, timeout time.Duration, log *logger.Logger) TestResult {
-	endpoint, err := proxyEndpoint(src)
-	if err != nil {
-		return TestResult{ProxyId: proxyId, Ok: false, Error: fmt.Sprintf("无法解析代理地址: %v", err)}
-	}
-
-	start := time.Now()
-	conn, err := net.DialTimeout("tcp", endpoint, timeout)
-	latency := time.Since(start).Milliseconds()
-
-	if err != nil {
-		return TestResult{ProxyId: proxyId, Ok: false, LatencyMs: latency, Error: fmt.Sprintf("TCP 连接失败: %v", err)}
-	}
-	conn.Close()
-	return TestResult{ProxyId: proxyId, Ok: true, LatencyMs: latency}
-}
-
-func min(a, b int) int {
-	if a < b {
-		return a
-	}
-	return b
+	return utils.NewUnsignedRangesFromList[uint16](items)
 }

@@ -182,13 +182,23 @@ if [[ "$SKIP_BUILD" -ne 1 ]]; then
   (cd "$ROOT_DIR/frontend" && BROWSERSLIST_IGNORE_OLD_DATA=1 npm ci --prefer-offline --no-audit --no-fund)
 
   echo "[2/5] Building frontend assets..."
-  (cd "$ROOT_DIR/frontend" && BROWSERSLIST_IGNORE_OLD_DATA=1 npm run build)
+  (cd "$ROOT_DIR/frontend" && BROWSERSLIST_IGNORE_OLD_DATA=1 npm run build:clean)
 
   echo "[3/5] Building app binary with Wails..."
   rm -f "$APP_BIN"
+  WAILS_BUILD_TAGS=()
+  if pkg-config --exists webkit2gtk-4.0; then
+    echo "  WebKitGTK pkg-config: webkit2gtk-4.0"
+  elif pkg-config --exists webkit2gtk-4.1; then
+    echo "  WebKitGTK pkg-config: webkit2gtk-4.1 (using Wails webkit2_41 tag)"
+    WAILS_BUILD_TAGS=(-tags webkit2_41)
+  else
+    echo "[ERROR] missing WebKitGTK development package: webkit2gtk-4.0 or webkit2gtk-4.1" >&2
+    exit 1
+  fi
   (
     cd "$ROOT_DIR"
-    wails build -s -platform "linux/$ARCH" -o ant-chrome
+    wails build -s -platform "linux/$ARCH" "${WAILS_BUILD_TAGS[@]}" -o ant-chrome
   )
 else
   echo "[WARN] skipping build step"

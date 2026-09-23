@@ -11,5 +11,4 @@ export {
   BookmarkSettingsPage,
   LaunchApiDocsPage,
   AutomationPage,
-  UsageTutorialPage,
 } from './pages'

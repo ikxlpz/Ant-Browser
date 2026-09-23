@@ -26,7 +26,7 @@ func NewSQLiteBookmarkDAO(db *sql.DB) *SQLiteBookmarkDAO {
 // List 查询所有默认书签，按 sort_order 升序
 func (d *SQLiteBookmarkDAO) List() ([]config.BrowserBookmark, error) {
 	rows, err := d.db.Query(`
-		SELECT name, url FROM browser_bookmarks ORDER BY sort_order ASC, id ASC`)
+		SELECT name, url, COALESCE(open_on_start, 0) FROM browser_bookmarks ORDER BY sort_order ASC, id ASC`)
 	if err != nil {
 		return nil, fmt.Errorf("查询书签列表失败: %w", err)
 	}
@@ -35,9 +35,11 @@ func (d *SQLiteBookmarkDAO) List() ([]config.BrowserBookmark, error) {
 	var list []config.BrowserBookmark
 	for rows.Next() {
 		var b config.BrowserBookmark
-		if err := rows.Scan(&b.Name, &b.URL); err != nil {
+		var openOnStart int
+		if err := rows.Scan(&b.Name, &b.URL, &openOnStart); err != nil {
 			return nil, fmt.Errorf("读取书签行失败: %w", err)
 		}
+		b.OpenOnStart = openOnStart != 0
 		list = append(list, b)
 	}
 	return list, rows.Err()
@@ -59,11 +61,18 @@ func (d *SQLiteBookmarkDAO) ReplaceAll(bookmarks []config.BrowserBookmark) error
 			continue
 		}
 		if _, err := tx.Exec(
-			`INSERT INTO browser_bookmarks (name, url, sort_order) VALUES (?, ?, ?)`,
-			b.Name, b.URL, i,
+			`INSERT INTO browser_bookmarks (name, url, open_on_start, sort_order) VALUES (?, ?, ?, ?)`,
+			b.Name, b.URL, boolToInt(b.OpenOnStart), i,
 		); err != nil {
 			return fmt.Errorf("插入书签失败: %w", err)
 		}
 	}
 	return tx.Commit()
+}
+
+func boolToInt(value bool) int {
+	if value {
+		return 1
+	}
+	return 0
 }

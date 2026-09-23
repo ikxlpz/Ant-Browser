@@ -2,150 +2,166 @@ package backend
 
 import (
 	"ant-chrome/backend/internal/logger"
-	"fmt"
+	"context"
 	"os/exec"
-	stdruntime "runtime"
-	"sync"
-	"time"
+	goruntime "runtime"
+	"strings"
 )
 
-type browserProcessSnapshot struct {
-	profileID string
-	cmd       *exec.Cmd
+func (a *App) shutdown(ctx context.Context) {
+	log := logger.New("App")
+	a.stopRuntimeEvents()
+	a.stopBackupScheduler()
+	if a.shouldStopRuntimeServicesOnShutdown() {
+		log.Info("应用正在关闭...")
+		a.stopRuntimeServices()
+	} else {
+		log.Info("应用正在关闭（保留当前已打开的浏览器实例）...")
+		a.stopAppOnlyRuntimeServices()
+	}
+	a.finalizeShutdown()
+}
+
+func (a *App) GetInterceptor() *logger.MethodInterceptor {
+	return a.interceptor
+}
+
+// ForceQuit 设置强制退出标志并调用 runtime.Quit
+func (a *App) ForceQuit() {
+	a.setQuitMode(quitModeFull)
+	a.stopRuntimeEvents()
+	a.stopRuntimeServices()
+	a.runtimeQuit()
+}
+
+// QuitAppOnly 仅退出应用本身，保留当前已打开的浏览器实例。
+func (a *App) QuitAppOnly() {
+	a.setQuitMode(quitModeAppOnly)
+	a.stopRuntimeEvents()
+	a.runtimeQuit()
+}
+
+func Start(a *App, ctx context.Context) {
+	a.startup(ctx)
+}
+
+func Stop(a *App, ctx context.Context) {
+	a.shutdown(ctx)
+}
+
+func platformSupportsTrayCloseFlow() bool {
+	return platformSupportsTrayCloseFlowForOS(goruntime.GOOS)
+}
+
+func platformSupportsTrayCloseFlowForOS(goos string) bool {
+	return strings.EqualFold(strings.TrimSpace(goos), "windows")
+}
+
+func (a *App) setQuitMode(mode quitMode) {
+	a.quitMu.Lock()
+	defer a.quitMu.Unlock()
+	a.forceQuit = true
+	a.quitMode = mode
+}
+
+func (a *App) isQuitRequested() bool {
+	a.quitMu.RLock()
+	defer a.quitMu.RUnlock()
+	return a.forceQuit
+}
+
+func (a *App) shouldStopRuntimeServicesOnShutdown() bool {
+	a.quitMu.RLock()
+	defer a.quitMu.RUnlock()
+	return a.quitMode != quitModeAppOnly
+}
+
+func ShouldBlockClose(a *App, ctx context.Context) bool {
+	if a.isQuitRequested() {
+		return false
+	}
+	if !platformSupportsTrayCloseFlow() {
+		return false
+	}
+	a.emitRuntimeEventWithContext(ctx, "app:request-close")
+	return true
 }
 
 func (a *App) stopRuntimeServices() {
+	a.stopRuntimeEvents()
+	a.waitBackgroundTasks()
 	a.stopServicesOnce.Do(func() {
-		log := logger.New("App")
-
-		a.stopAllBrowserProcessesForExit(log)
-
-		if a.xrayMgr != nil {
-			a.xrayMgr.StopAll()
+		if a.automationMgr != nil {
+			a.automationMgr.StopAllTasks()
 		}
-		a.clearProfileXrayBridges()
-
-		if a.singboxMgr != nil {
-			a.singboxMgr.StopAll()
-		}
-
-		if a.clashMgr != nil {
-			a.clashMgr.StopAll()
-		}
-
 		if a.speedScheduler != nil {
 			a.speedScheduler.Stop()
 			a.speedScheduler = nil
 		}
-
-		if a.launchServer != nil {
-			if err := a.launchServer.Stop(); err != nil {
-				log.Error("LaunchServer 关闭失败", logger.F("error", err))
-			}
-			a.launchServer = nil
+		a.stopTrackedBrowserProcesses()
+		if a.xrayMgr != nil {
+			a.xrayMgr.StopAll()
 		}
-
-		if err := killResidualRuntimeProcesses(a.appRoot); err != nil {
-			log.Error("退出前清理残留进程失败", logger.F("error", err.Error()))
+		a.clearProfileProxyBridges()
+		if a.clashMgr != nil {
+			a.clashMgr.StopAll()
 		}
-	})
-}
-
-func (a *App) finalizeShutdown() {
-	a.finalizeOnce.Do(func() {
-		if a.db != nil {
-			a.db.Close()
-			a.db = nil
-		}
-		if err := logger.Close(); err != nil {
-			fmt.Printf("关闭日志系统失败: %v\n", err)
+		if a.singboxMgr != nil {
+			a.singboxMgr.StopAll()
 		}
 	})
 }
 
-func (a *App) stopAllBrowserProcessesForExit(log *logger.Logger) {
+func (a *App) stopAppOnlyRuntimeServices() {
+	a.stopRuntimeEvents()
+	a.waitBackgroundTasks()
+	if a.automationMgr != nil {
+		a.automationMgr.StopAllTasks()
+	}
+	if a.speedScheduler != nil {
+		a.speedScheduler.Stop()
+		a.speedScheduler = nil
+	}
+}
+
+func (a *App) stopTrackedBrowserProcesses() {
 	if a.browserMgr == nil {
 		return
 	}
 
-	stoppedAt := time.Now().Format(time.RFC3339)
+	a.browserMgr.Mutex.Lock()
+	cmds := make([]*exec.Cmd, 0, len(a.browserMgr.BrowserProcesses))
+	for _, cmd := range a.browserMgr.BrowserProcesses {
+		cmds = append(cmds, cmd)
+	}
+	a.browserMgr.Mutex.Unlock()
+
+	for _, cmd := range cmds {
+		_ = a.stopProcessCmd(cmd)
+	}
 
 	a.browserMgr.Mutex.Lock()
-	processes := make([]browserProcessSnapshot, 0, len(a.browserMgr.BrowserProcesses))
-	for profileID, cmd := range a.browserMgr.BrowserProcesses {
-		if profile, ok := a.browserMgr.Profiles[profileID]; ok && profile != nil {
-			profile.Running = false
-			profile.LastStopAt = stoppedAt
+	defer a.browserMgr.Mutex.Unlock()
+
+	for profileID, profile := range a.browserMgr.Profiles {
+		if profile == nil {
+			continue
 		}
-		if cmd != nil && cmd.Process != nil {
-			processes = append(processes, browserProcessSnapshot{
-				profileID: profileID,
-				cmd:       cmd,
-			})
+		if profile.Running || a.browserMgr.BrowserProcesses[profileID] != nil {
+			a.markProfileStoppedLocked(profileID, profile)
 		}
 	}
 	a.browserMgr.BrowserProcesses = make(map[string]*exec.Cmd)
-	a.browserMgr.Mutex.Unlock()
-
-	if len(processes) == 0 {
-		return
-	}
-
-	var wg sync.WaitGroup
-	for _, item := range processes {
-		wg.Add(1)
-		go func(item browserProcessSnapshot) {
-			defer wg.Done()
-
-			pid := 0
-			if item.cmd != nil && item.cmd.Process != nil {
-				pid = item.cmd.Process.Pid
-			}
-			log.Info("退出前关闭浏览器实例", logger.F("profile_id", item.profileID), logger.F("pid", pid))
-			if err := stopProcessCmdForShutdown(item.cmd); err != nil {
-				log.Error("退出前关闭浏览器实例失败", logger.F("profile_id", item.profileID), logger.F("pid", pid), logger.F("error", err.Error()))
-			}
-		}(item)
-	}
-	wg.Wait()
 }
 
-func stopProcessCmdForShutdown(cmd *exec.Cmd) error {
-	if cmd == nil || cmd.Process == nil {
-		return nil
-	}
-
-	pid := cmd.Process.Pid
-	if pid > 0 {
-		if err := forceKillProcessTree(pid); err == nil || isProcessAlreadyFinished(err) {
-			return nil
+func (a *App) finalizeShutdown() {
+	a.finalizeOnce.Do(func() {
+		if a.launchServer != nil {
+			_ = a.launchServer.Stop()
 		}
-	}
-
-	err := cmd.Process.Kill()
-	if err == nil || isProcessAlreadyFinished(err) {
-		return nil
-	}
-	return err
-}
-
-func forceKillProcessTree(pid int) error {
-	if pid <= 0 {
-		return nil
-	}
-	if stdruntime.GOOS != "windows" {
-		return fmt.Errorf("force kill process tree unsupported on %s", stdruntime.GOOS)
-	}
-
-	killCmd := exec.Command("taskkill", "/F", "/T", "/PID", fmt.Sprintf("%d", pid))
-	hideWindow(killCmd)
-	err := killCmd.Run()
-	if err == nil {
-		_ = waitProcessExitWindows(pid, 1500*time.Millisecond)
-		return nil
-	}
-	if waitProcessExitWindows(pid, 300*time.Millisecond) {
-		return nil
-	}
-	return err
+		if a.db != nil {
+			_ = a.db.Close()
+		}
+		_ = logger.Close()
+	})
 }
