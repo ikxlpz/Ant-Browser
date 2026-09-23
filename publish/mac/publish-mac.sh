@@ -9,6 +9,8 @@ VERSION=""
 SKIP_BUILD=0
 SKIP_RUNTIME_VERIFY=0
 KEEP_STAGING=0
+SIGN_IDENTITY=""
+APP_NAME=""
 
 usage() {
   cat <<'EOF'
@@ -16,12 +18,15 @@ Usage:
   publish/mac/publish-mac.sh --arch <arm64|amd64> [options]
 
 Options:
-  --arch <arm64|amd64>   Target architecture (required)
-  --version <ver>        Package version (default: read from wails.json)
-  --skip-build           Skip frontend and Wails build steps
-  --skip-runtime-verify  Skip runtime hash verification
-  --keep-staging         Keep assembled .app bundle in publish/staging/mac
-  -h, --help             Show help
+  --arch <arm64|amd64>       Target architecture (required)
+  --version <ver>            Package version (default: read from wails.json)
+  --app-name <name>          Custom app bundle name (e.g. "Ant.app" or "Ant")
+  --sign, --identity <name>  Code signing identity (e.g. "Developer ID Application: ...",
+                             "Apple Development: ...", or "-" for ad-hoc signing)
+  --skip-build               Skip frontend and Wails build steps
+  --skip-runtime-verify      Skip runtime hash verification
+  --keep-staging             Keep assembled .app bundle in publish/staging/mac
+  -h, --help                 Show help
 EOF
 }
 
@@ -33,6 +38,14 @@ while [[ $# -gt 0 ]]; do
       ;;
     --version)
       VERSION="${2:-}"
+      shift 2
+      ;;
+    --app-name)
+      APP_NAME="${2:-}"
+      shift 2
+      ;;
+    --sign|--identity)
+      SIGN_IDENTITY="${2:-}"
       shift 2
       ;;
     --skip-build)
@@ -91,6 +104,15 @@ if [[ "$HOST_ARCH" != "$ARCH" ]]; then
   exit 1
 fi
 
+if ! command -v wails >/dev/null 2>&1; then
+  if command -v go >/dev/null 2>&1; then
+    gopath_bin="$(go env GOPATH)/bin"
+    if [[ -x "$gopath_bin/wails" ]]; then
+      export PATH="$PATH:$gopath_bin"
+    fi
+  fi
+fi
+
 require_cmd() {
   if ! command -v "$1" >/dev/null 2>&1; then
     echo "[ERROR] required command not found: $1" >&2
@@ -98,12 +120,17 @@ require_cmd() {
   fi
 }
 
-require_cmd python3
+PYTHON_BIN="python3"
+if [[ -x "/usr/bin/python3" ]]; then
+  PYTHON_BIN="/usr/bin/python3"
+fi
+
+require_cmd "$PYTHON_BIN"
 require_cmd ditto
 require_cmd wails
 
 if [[ -z "$VERSION" ]]; then
-  VERSION="$(python3 - "$ROOT_DIR/wails.json" <<'PY'
+  VERSION="$("$PYTHON_BIN" - "$ROOT_DIR/wails.json" <<'PY'
 import json
 import sys
 
@@ -125,13 +152,24 @@ SINGBOX_SRC="$RUNTIME_DIR/sing-box"
 APP_BIN_DIR="$ROOT_DIR/build/bin"
 CHROME_README_SRC="$ROOT_DIR/chrome/README.md"
 CONFIG_INIT_SRC="$ROOT_DIR/publish/config.init.mac.yaml"
-ZIP_NAME="AntBrowser-${VERSION}-macos-${ARCH}.zip"
-APP_EXPORT="$OUTPUT_DIR/AntBrowser-${VERSION}-macos-${ARCH}.app"
 STAGE_DIR="$STAGING_ROOT/$TARGET"
-APP_STAGE="$STAGE_DIR/Ant Browser.app"
+if [[ -n "$APP_NAME" ]]; then
+  if [[ "$APP_NAME" != *.app ]]; then
+    APP_BUNDLE_NAME="${APP_NAME}.app"
+  else
+    APP_BUNDLE_NAME="$APP_NAME"
+  fi
+  APP_EXPORT="$OUTPUT_DIR/$APP_BUNDLE_NAME"
+  ZIP_NAME="${APP_BUNDLE_NAME%.app}.zip"
+  APP_STAGE="$STAGE_DIR/$APP_BUNDLE_NAME"
+else
+  ZIP_NAME="AntBrowser-${VERSION}-macos-${ARCH}.zip"
+  APP_EXPORT="$OUTPUT_DIR/AntBrowser-${VERSION}-macos-${ARCH}.app"
+  APP_STAGE="$STAGE_DIR/Ant Browser.app"
+fi
 
 find_built_app_bundle() {
-  python3 - "$APP_BIN_DIR" <<'PY'
+  "$PYTHON_BIN" - "$APP_BIN_DIR" <<'PY'
 from pathlib import Path
 import sys
 
@@ -149,7 +187,7 @@ PY
 }
 
 manifest_has_target() {
-  python3 - "$ROOT_DIR/publish/runtime-manifest.json" "$TARGET" <<'PY'
+  "$PYTHON_BIN" - "$ROOT_DIR/publish/runtime-manifest.json" "$TARGET" <<'PY'
 import json
 import sys
 
@@ -233,15 +271,43 @@ fi
 mkdir -p "$APP_MACOS_DIR/bin"
 cp "$XRAY_SRC" "$APP_MACOS_DIR/bin/xray"
 cp "$SINGBOX_SRC" "$APP_MACOS_DIR/bin/sing-box"
-cp "$CONFIG_INIT_SRC" "$APP_MACOS_DIR/config.yaml"
 chmod +x "$APP_MACOS_DIR/bin/xray" "$APP_MACOS_DIR/bin/sing-box"
 
+APP_RESOURCES_DIR="$APP_STAGE/Contents/Resources"
+mkdir -p "$APP_RESOURCES_DIR"
+cp "$CONFIG_INIT_SRC" "$APP_RESOURCES_DIR/config.yaml"
+
 if [[ -f "$CHROME_README_SRC" ]]; then
-  mkdir -p "$APP_MACOS_DIR/chrome"
-  cp "$CHROME_README_SRC" "$APP_MACOS_DIR/chrome/README.md"
+  mkdir -p "$APP_RESOURCES_DIR/chrome"
+  cp "$CHROME_README_SRC" "$APP_RESOURCES_DIR/chrome/README.md"
+fi
+
+if [[ -n "$APP_NAME" && -f "$APP_STAGE/Contents/Info.plist" ]]; then
+  display_name="${APP_BUNDLE_NAME%.app}"
+  /usr/libexec/PlistBuddy -c "Set :CFBundleName $display_name" "$APP_STAGE/Contents/Info.plist" 2>/dev/null || true
+  /usr/libexec/PlistBuddy -c "Set :CFBundleDisplayName $display_name" "$APP_STAGE/Contents/Info.plist" 2>/dev/null || \
+  /usr/libexec/PlistBuddy -c "Add :CFBundleDisplayName string $display_name" "$APP_STAGE/Contents/Info.plist" 2>/dev/null || true
+fi
+
+if [[ -n "$SIGN_IDENTITY" ]]; then
+  echo "Signing app bundle with identity: '$SIGN_IDENTITY'..."
+  if [[ "$SIGN_IDENTITY" == "-" ]]; then
+    codesign --force --sign - "$APP_MACOS_DIR/bin/xray"
+    codesign --force --sign - "$APP_MACOS_DIR/bin/sing-box"
+    codesign --force --sign - "$APP_MACOS_DIR/ant-chrome"
+    codesign --force --deep --sign - "$APP_STAGE"
+  else
+    codesign --force --options runtime --timestamp --sign "$SIGN_IDENTITY" "$APP_MACOS_DIR/bin/xray"
+    codesign --force --options runtime --timestamp --sign "$SIGN_IDENTITY" "$APP_MACOS_DIR/bin/sing-box"
+    codesign --force --options runtime --timestamp --sign "$SIGN_IDENTITY" "$APP_MACOS_DIR/ant-chrome"
+    codesign --force --options runtime --timestamp --sign "$SIGN_IDENTITY" "$APP_STAGE"
+  fi
+  echo "Verifying code signature..."
+  codesign --verify --deep --strict --verbose=2 "$APP_STAGE"
 fi
 
 ditto "$APP_STAGE" "$APP_EXPORT"
+xattr -cr "$APP_EXPORT" 2>/dev/null || true
 rm -f "$OUTPUT_DIR/$ZIP_NAME"
 ditto -c -k --sequesterRsrc --keepParent "$APP_EXPORT" "$OUTPUT_DIR/$ZIP_NAME"
 

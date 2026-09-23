@@ -77,26 +77,44 @@ func ensureWritableLayoutForOS(appRoot, goos string) error {
 		return err
 	}
 
+	configSrc := resolveBundleSource(root.installRoot, "config.yaml")
 	if err := copyFileIfMissing(
-		filepath.Join(root.installRoot, "config.yaml"),
+		configSrc,
 		filepath.Join(root.stateRoot, "config.yaml"),
 	); err != nil {
 		return err
 	}
+	proxiesSrc := resolveBundleSource(root.installRoot, "proxies.yaml")
 	if err := copyFileIfMissing(
-		filepath.Join(root.installRoot, "proxies.yaml"),
+		proxiesSrc,
 		filepath.Join(root.stateRoot, "proxies.yaml"),
 	); err != nil {
 		return err
 	}
+	chromeSrc := resolveBundleSource(root.installRoot, "chrome")
 	if err := copyDirIfMissing(
-		filepath.Join(root.installRoot, "chrome"),
+		chromeSrc,
 		filepath.Join(root.stateRoot, "chrome"),
 	); err != nil {
 		return err
 	}
 
 	return nil
+}
+
+func resolveBundleSource(installRoot, relPath string) string {
+	candidate := filepath.Join(installRoot, relPath)
+	if _, err := os.Stat(candidate); err == nil {
+		return candidate
+	}
+	clean := strings.TrimSuffix(filepath.ToSlash(filepath.Clean(installRoot)), "/")
+	if strings.HasSuffix(strings.ToLower(clean), ".app/contents/macos") {
+		resCandidate := filepath.Join(filepath.Dir(clean), "Resources", relPath)
+		if _, err := os.Stat(resCandidate); err == nil {
+			return resCandidate
+		}
+	}
+	return candidate
 }
 
 func detect(appRoot string) roots {
