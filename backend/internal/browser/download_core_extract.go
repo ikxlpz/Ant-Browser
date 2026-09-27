@@ -9,6 +9,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 
 	"github.com/ulikunitz/xz"
@@ -24,11 +25,19 @@ type archiveProgress struct {
 }
 
 func SupportedCoreArchivePattern() string {
-	return "*.zip;*.tar;*.tar.gz;*.tgz;*.tar.xz;*.txz;*.tar.bz2;*.tbz2"
+	pattern := "*.zip;*.tar;*.tar.gz;*.tgz;*.tar.xz;*.txz;*.tar.bz2;*.tbz2"
+	if runtime.GOOS == "darwin" {
+		pattern += ";*.dmg"
+	}
+	return pattern
 }
 
 func SupportedCoreArchiveDescription() string {
-	return "支持 ZIP、TAR、TAR.GZ、TAR.XZ、TAR.BZ2"
+	description := "支持 ZIP、TAR、TAR.GZ、TAR.XZ、TAR.BZ2"
+	if runtime.GOOS == "darwin" {
+		description += "、DMG"
+	}
+	return description
 }
 
 func coreArchiveTempPattern(rawURL string) string {
@@ -51,7 +60,13 @@ func filepathFromURLPath(raw string) (string, error) {
 }
 
 func extractCoreArchiveAndStripRoot(archivePath, dest string, progressCb func(int, string)) error {
+	if progressCb == nil {
+		progressCb = func(int, string) {}
+	}
 	lower := strings.ToLower(archivePath)
+	if strings.HasSuffix(lower, ".dmg") {
+		return extractDMGCoreArchive(archivePath, dest, progressCb)
+	}
 	if strings.HasSuffix(lower, ".zip") {
 		return extractZipArchiveAndStripRoot(archivePath, dest, progressCb)
 	}
@@ -216,7 +231,7 @@ func tarStreamReader(archivePath string, file *os.File) (io.Reader, func(), erro
 
 func isTarArchivePath(path string) bool {
 	for _, suffix := range coreArchiveSuffixes() {
-		if suffix == ".zip" {
+		if suffix == ".zip" || suffix == ".dmg" {
 			continue
 		}
 		if strings.HasSuffix(path, suffix) {
@@ -227,7 +242,7 @@ func isTarArchivePath(path string) bool {
 }
 
 func coreArchiveSuffixes() []string {
-	return []string{".tar.gz", ".tar.xz", ".tar.bz2", ".tgz", ".txz", ".tbz2", ".zip", ".tar"}
+	return []string{".tar.gz", ".tar.xz", ".tar.bz2", ".tgz", ".txz", ".tbz2", ".zip", ".tar", ".dmg"}
 }
 
 func detectCommonArchiveRoot(entries []archiveEntryMeta) (string, bool) {

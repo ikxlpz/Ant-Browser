@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 
 	wailsruntime "github.com/wailsapp/wails/v2/pkg/runtime"
@@ -118,13 +119,7 @@ func (a *App) BrowserCoreImportLocal() (*BrowserCore, error) {
 		return nil, fmt.Errorf("browser manager is nil")
 	}
 
-	selectedPath, err := wailsruntime.OpenFileDialog(a.ctx, wailsruntime.OpenDialogOptions{
-		Title: "选择 Chrome 内核归档文件",
-		Filters: []wailsruntime.FileFilter{
-			{DisplayName: "Chrome 内核归档 (" + browser.SupportedCoreArchiveDescription() + ")", Pattern: browser.SupportedCoreArchivePattern()},
-			{DisplayName: "所有文件 (*.*)", Pattern: "*.*"},
-		},
-	})
+	selectedPath, err := wailsruntime.OpenFileDialog(a.ctx, browserCoreImportDialogOptions(runtime.GOOS))
 	if err != nil {
 		return nil, err
 	}
@@ -138,6 +133,21 @@ func (a *App) BrowserCoreImportLocal() (*BrowserCore, error) {
 		return nil, err
 	}
 	return a.importLocalBrowserCoreArchive(absPath)
+}
+
+func browserCoreImportDialogOptions(goos string) wailsruntime.OpenDialogOptions {
+	options := wailsruntime.OpenDialogOptions{Title: "选择 Chrome 内核归档文件"}
+	if goos == "darwin" {
+		// Wails 2.12 将过滤项转换为 UTType 后直接加入 NSArray；tar.gz 等
+		// 复合扩展名会返回 nil，触发无法由 Go recover 捕获的原生异常。
+		// macOS 用空过滤列表表示“所有文件”，选中后仍由导入流程校验内核包。
+		return options
+	}
+	options.Filters = []wailsruntime.FileFilter{
+		{DisplayName: "Chrome 内核归档 (" + browser.SupportedCoreArchiveDescription() + ")", Pattern: browser.SupportedCoreArchivePattern()},
+		{DisplayName: "所有文件 (*.*)", Pattern: "*.*"},
+	}
+	return options
 }
 
 func (a *App) importLocalBrowserCoreArchive(archivePath string) (*BrowserCore, error) {
